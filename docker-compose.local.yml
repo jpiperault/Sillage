@@ -1,0 +1,42 @@
+# Essai local uniquement. Valeurs factices : ne pas réutiliser en production.
+# Lancer : docker compose -f docker-compose.local.yml up --build
+# Port déjà pris (par ex. 8080 par Caddy) : SILLAGE_PORT=8090 docker compose -f docker-compose.local.yml up --build
+name: sillage-local
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: sillage
+      POSTGRES_PASSWORD: sillage-local
+      POSTGRES_DB: sillage
+    volumes:
+      - ./.data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sillage -d sillage"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build: .
+    image: sillage:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://sillage:sillage-local@postgres:5432/sillage
+      JWT_SECRET: dev-only-secret-0123456789abcdef0123456789abcdef
+      ADMIN_EMAIL: admin@example.test
+      ADMIN_PASSWORD: dev-admin-password
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-}
+      QUIVER_API_KEY: ${QUIVER_API_KEY:-}
+      INGEST_ENABLED: ${INGEST_ENABLED:-true}
+      BACKFILL_DAYS: ${BACKFILL_DAYS:-3}
+    volumes:
+      - ./.data/app:/data
+    ports:
+      - "127.0.0.1:${SILLAGE_PORT:-8080}:8080"
+    mem_limit: 384m
+    stop_grace_period: 10s
+    restart: unless-stopped
