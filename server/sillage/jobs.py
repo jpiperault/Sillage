@@ -6,7 +6,7 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
-from . import db, log, paper
+from . import alerts, backtest, db, log, paper
 from .config import Settings
 from .ingest import amf, congress, finra, funds, house, prices, sec
 
@@ -37,17 +37,34 @@ async def job_info(conn, name: str) -> dict:
 
 
 class Ingestor:
-    def __init__(self, settings: Settings, pool, price_client: prices.PriceClient):
-        self.s = settings
+    def __init__(self, get_settings, pool, price_client: prices.PriceClient, build_signals=None):
+        """get_settings() : réglages à jour (variables + interface), relus à chaque cycle."""
+        self.get_settings = get_settings
         self.pool = pool
         self.prices = price_client
-        self.sec = sec.SecClient(settings.sec_user_agent)
-        self.house = house.HouseClient(settings.sec_user_agent)
+        self.build_signals = build_signals
+        self._ua = get_settings().sec_user_agent
+        self.sec = sec.SecClient(self._ua)
+        self.house = house.HouseClient(self._ua)
         self.amf = amf.AmfClient()
+        self.history = backtest.HistoryClient()
         self.stop = asyncio.Event()
         self.wake = asyncio.Event()
         self.running = False
         self.task: asyncio.Task | None = None
+
+    @property
+    def s(self) -> Settings:
+        return self.get_settings()
+
+    async def _refresh_clients(self) -> None:
+        """Contact SEC modifié dans l'interface : nouveaux clients HTTP."""
+        if self.s.sec_user_agent != self._ua:
+            await self.sec.close()
+            await self.house.close()
+            self._ua = self.s.sec_user_agent
+            self.sec = sec.SecClient(self._ua)
+            self.house = house.HouseClient(self._ua)
 
     def start(self) -> None:
         self.task = asyncio.create_task(self._loop(), name="ingest")
@@ -71,6 +88,7 @@ class Ingestor:
         await self.sec.close()
         await self.house.close()
         await self.amf.close()
+        await self.history.close()
 
     async def _loop(self) -> None:
         await asyncio.sleep(2)  # laisse le serveur finir de démarrer
@@ -97,6 +115,7 @@ class Ingestor:
                 return
             self.running = True
             t0 = time.monotonic()
+            await self._refresh_clients()
             try:
                 async with self.pool.connection() as conn:
                     await self._steps(conn)
@@ -206,6 +225,35 @@ class Ingestor:
         async def short_volume():
             return await finra.refresh(conn)
 
+        async def bt_import():
+            st = await job_info(conn, "bt_import")
+            last = st["last_ok_at"]
+            if last and datetime.now(timezone.utc) - last < timedelta(hours=24):
+                return {"skipped": True}
+            res = await backtest.import_quarters(self.sec, conn, self.s.backtest_quarters)
+            if res["have"] < res["available"]:
+                # Il reste des trimestres : on repassera au prochain cycle (sans attendre 24 h).
+                raise_later["bt_import"] = True
+            return res
+
+        async def bt_prices():
+            return await backtest.refresh_histories(conn, self.history, stop=self.stop)
+
+        async def bt_report():
+            st = await job_info(conn, "bt_report")
+            last = st["last_ok_at"]
+            prices_info = (await job_info(conn, "bt_prices"))["info"] or {}
+            if last and datetime.now(timezone.utc) - last < timedelta(hours=24) and not prices_info.get("fetched"):
+                return {"skipped": True}
+            return await backtest.compute(conn)
+
+        async def alerts_step():
+            tg = alerts.Telegram(self.s.telegram_bot_token)
+            try:
+                return await alerts.send_alerts(conn, tg, self.build_signals, self.s.public_url)
+            finally:
+                await tg.close()
+
         async def congress_step():
             return {"new": await congress.fetch_and_store(self.s.quiver_api_key, conn,
                                                           skip_house=self.s.house_enabled)}
@@ -240,3 +288,13 @@ class Ingestor:
             await self._step(conn, "short_volume", short_volume)
         await self._step(conn, "prices", prices_step)
         await self._step(conn, "stops", stops)
+        if self.s.telegram_bot_token and self.build_signals:
+            await self._step(conn, "alerts", alerts_step)
+        if self.s.backtest_enabled:
+            raise_later: dict = {}
+            await self._step(conn, "bt_import", bt_import)
+            if raise_later.get("bt_import"):
+                await conn.execute("UPDATE job_state SET last_ok_at = NULL WHERE name='bt_import'")
+                await conn.commit()
+            await self._step(conn, "bt_prices", bt_prices)
+            await self._step(conn, "bt_report", bt_report)

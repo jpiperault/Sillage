@@ -21,6 +21,11 @@ avec un mode Entraînement en argent fictif. Un seul conteneur, état entièreme
 
 ## Variables d'environnement
 
+Seules `DATABASE_URL`, `JWT_SECRET`, `ADMIN_EMAIL` et `ADMIN_PASSWORD` doivent être des variables. Tout le reste se
+règle aussi dans l'interface (**Compte → Réglages**, administrateur) : la valeur saisie dans l'interface prime sur la
+variable, « Rétablir » revient à la variable ou au défaut, et la prise en compte se fait au cycle de collecte suivant
+sans redémarrage.
+
 | Variable | Obligatoire | Rôle |
 |---|---|---|
 | `DATABASE_URL` | oui (Hangar) | `postgresql://user:mdp@hôte:5432/base` |
@@ -34,6 +39,10 @@ avec un mode Entraînement en argent fictif. Un seul conteneur, état entièreme
 | `AMF_ENABLED` | non | `true` par défaut : déclarations des dirigeants français (AMF, base BDIF). |
 | `FUNDS_13F` | non | Fonds suivis via leurs 13F : vide = 18 grands fonds par défaut (Berkshire, Pershing Square, Baupost…), liste de CIK séparés par des virgules pour choisir, `off` pour désactiver. CUSIP → ticker via OpenFIGI (gratuit). |
 | `FINRA_ENABLED` | non | `true` par défaut : part quotidienne des ventes à découvert (FINRA), affichée dans le ticket. |
+| `BACKTEST_ENABLED` | non | `true` par défaut : backtest du score (historique SEC + cours Nasdaq), voir plus bas. |
+| `BACKTEST_QUARTERS` | non | Trimestres d'historique Form 4 analysés, 6 par défaut (1 à 12). |
+| `TELEGRAM_BOT_TOKEN` | non | Jeton d'un bot créé avec @BotFather : active les alertes Telegram. |
+| `PUBLIC_URL` | non | Adresse publique (`https://sillage.piperault.fr`) pour les liens des alertes. |
 | `ALLOW_SIGNUP` | non | `true` par défaut ; `false` ferme les inscriptions. |
 | `INGEST_ENABLED` | non | `true` par défaut. |
 | `INGEST_INTERVAL_MIN` | non | 10 par défaut. |
@@ -60,6 +69,7 @@ passer pour l'admin). C'est un mot de passe que personne ne tape : on le génèr
 | sec.gov (Form 4, Form 144, 13D/13G, 13F, tickers) | `User-Agent: <SEC_USER_AGENT>`, par défaut `Sillage/1.0 <ADMIN_EMAIL>` |
 | disclosures-clerk.house.gov (élus) | le même en-tête |
 | AMF, FINRA, Yahoo, Nasdaq | en-tête de navigateur générique, aucune donnée personnelle |
+| api.telegram.org (si jeton réglé) | le texte des alertes et l'identifiant de conversation de chaque utilisateur lié |
 | OpenFIGI | en-tête par défaut de la bibliothèque HTTP + les CUSIP à convertir |
 | Quiver Quantitative (si clé) | la clé `QUIVER_API_KEY` |
 
@@ -130,6 +140,27 @@ Tests :
 docker run --rm -v "$PWD/server":/src -w /src python:3.12-slim sh -c "pip install -q -r requirements.txt -r requirements-dev.txt && python -m pytest -q tests"
 ```
 
+## Backtest du score
+
+Onglet **Signaux → Ce que vaut le score**. Sillage importe les jeux de données trimestriels de la SEC (tous les Form 4,
+~11 Mo par trimestre, un trimestre par cycle) et les cours de clôture Nasdaq sur 2 ans (150 titres par cycle, SPY
+compris). Pour chaque achat ou vente d'initié : achat fictif à la clôture qui suit la déclaration, puis écart de
+performance avec le S&P 500 à 1, 3 et 6 mois, par tranche de score et par critère (rôle, montant, délai, cluster,
+plan 10b5-1, taille par rapport à la position, prix). Rapport recalculé une fois par jour. Il faut environ 20 cycles
+(3 à 4 h) après le premier démarrage pour que tous les cours soient chargés ; le rapport s'affiche dès le premier calcul.
+
+## Alertes Telegram
+
+1. Dans Telegram, écrire à **@BotFather**, commande `/newbot`, choisir un nom : il donne un jeton `123456:ABC…`.
+2. Le coller dans **Compte → Réglages → Jeton du bot Telegram**, avec l'adresse publique du site.
+3. Chaque utilisateur : **Compte → Alertes Telegram → Lier Telegram**, puis « Démarrer » dans Telegram. Il choisit son
+   score minimum, la watchlist et les stops fictifs. Les alertes partent à la fin de chaque cycle de collecte.
+
+## Fiche action
+
+Recherche « Ticker » dans la barre du haut, ou lien « fiche de l'action » dans un ticket : cours sur 1 an avec les
+achats et ventes déclarés, tous les signaux, Form 144, 13D/13G, grands fonds actionnaires (13F), ventes à découvert.
+
 ## Dépannage Hangar
 
 | Symptôme | Cause | Solution |
@@ -158,6 +189,11 @@ répond `ok`.
   sans ticker. Pas encore intégré à la convergence.
 - FINRA : volume des ventes à découvert du jour (pas la position vendeuse totale), 45 jours gardés, information
   seulement, sans effet sur le score.
+- Flux live : une ligne par déclaration et par code (plusieurs transactions regroupées, prix moyen pondéré) ; la
+  taille par rapport à la position (« ligne augmentée de X % ») est affichée sans effet sur le score.
+- Backtest : cours non officiels (Nasdaq) ; les titres radiés ou renommés n'ont pas de cours et sortent de l'échantillon
+  (biais du survivant) ; les montants sont ceux déclarés, sans frais ni glissement.
+- Alertes Telegram : non testées avec un vrai bot avant livraison (logique testée hors ligne).
 - Premier démarrage : ~470 PTR de l'année en file, lus par 150 à chaque cycle (environ 1 min par cycle).
 - Cours non officiels : Yahoo, puis Nasdaq en secours (Yahoo renvoie 429 depuis certaines adresses IP de serveur).
 - Pas encore d'alertes Telegram, de 13F ni de données AMF.

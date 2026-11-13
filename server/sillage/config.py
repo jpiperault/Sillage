@@ -50,6 +50,10 @@ class Settings:
     paper_start_cash: float
     port: int
     funds_13f: dict = field(default_factory=dict)
+    telegram_bot_token: str | None = None
+    public_url: str = ""
+    backtest_enabled: bool = True
+    backtest_quarters: int = 6
 
     @property
     def congress_enabled(self) -> bool:
@@ -108,4 +112,8 @@ def load_settings(env: dict | None = None) -> Settings:
         paper_start_cash=cash,
         port=_int(env, "PORT", 8080, minimum=1),
         funds_13f=parse_funds_setting(env.get("FUNDS_13F")),
+        telegram_bot_token=(env.get("TELEGRAM_BOT_TOKEN") or "").strip() or None,
+        public_url=(env.get("PUBLIC_URL") or "").strip().rstrip("/"),
+        backtest_enabled=_bool(env.get("BACKTEST_ENABLED"), True),
+        backtest_quarters=_int(env, "BACKTEST_QUARTERS", 6, minimum=1),
     )

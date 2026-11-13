@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { api } from './api.js'
 import { Notice, Score, Seg, SignalTable, useApi } from './components.jsx'
 import Ticket from './Ticket.jsx'
+import { Alerts, Backtest, Settings } from './extra.jsx'
 import { date, datetime, int, money, moneyCur, pct, signed, tone, usd } from './format.js'
 
 const DAYS = [['3', '3 j'], ['7', '7 j'], ['30', '30 j'], ['90', '90 j']]
@@ -348,7 +349,7 @@ function Funds13F() {
                   {moves.map((m) => (
                     <tr key={m.cusip + m.put_call}>
                       <td><span className={`badge ${MOVE_CLASS[m.status]}`}>{MOVE_LABEL[m.status]}</span>{m.put_call && <span className="muted small"> {m.put_call}</span>}</td>
-                      <td className="ticker">{m.ticker || '—'}</td>
+                      <td className="ticker">{m.ticker ? <a href={`#action/${m.ticker}`}>{m.ticker}</a> : '—'}</td>
                       <td className="wrap">{m.issuer}</td>
                       <td className="r num">{int(m.shares ?? 0)}</td>
                       <td className={`r num ${tone(m.change_pct)}`}>{m.status === 'new' ? 'nouvelle' : m.status === 'sold' ? `−${int(m.prev_shares)}` : pct(m.change_pct)}</td>
@@ -370,7 +371,7 @@ function Funds13F() {
                 <tbody>
                   {consensus.data.items.map((c) => (
                     <tr key={c.cusip}>
-                      <td className="ticker">{c.ticker || '—'}</td><td className="wrap">{c.issuer}</td>
+                      <td className="ticker">{c.ticker ? <a href={`#action/${c.ticker}`}>{c.ticker}</a> : '—'}</td><td className="wrap">{c.issuer}</td>
                       <td className="r num up">{c.buyers.length}</td><td className="r num sell">{c.sellers.length}</td>
                       <td className="wrap small muted">{c.buyers.map((b) => b.fund.split(' (')[0]).join(', ')}</td>
                     </tr>
@@ -443,7 +444,9 @@ function Ownership() {
 
 export function Guide() {
   return (
-    <div className="grid-2 guide">
+    <>
+    <Backtest />
+    <div className="grid-2 guide" style={{ marginTop: 16 }}>
       <section className="panel">
         <h2>Les signaux</h2>
         <dl>
@@ -489,6 +492,7 @@ export function Guide() {
         <p className="small">Sillage n'est pas un conseil en investissement. Les données publiques arrivent avec retard et les performances passées ne préjugent pas des performances futures.</p>
       </section>
     </div>
+    </>
   )
 }
 
@@ -533,6 +537,7 @@ export function Account({ me, onLogout }) {
           </form>
           <Notice msg={msg} />
         </section>
+        <Alerts />
         <section className="panel" aria-label="Watchlist">
           <h2>Watchlist</h2>
           {!watch.data?.items?.length ? <p className="muted">Vide. Ajoutez un ticker depuis un ticket de copie.</p> : (
@@ -542,7 +547,7 @@ export function Account({ me, onLogout }) {
                 <tbody>
                   {watch.data.items.map((w) => (
                     <tr key={w.ticker}>
-                      <td className="ticker">{w.ticker}</td><td className="wrap">{w.company || '—'}</td>
+                      <td className="ticker"><a href={`#action/${w.ticker}`}>{w.ticker}</a></td><td className="wrap">{w.company || '—'}</td>
                       <td className="r num">{usd(w.price)}</td><td className="num">{date(w.last_insider)}</td>
                       <td><button type="button" className="btn" onClick={() => removeWatch(w.ticker)} aria-label={`Retirer ${w.ticker}`}>Retirer</button></td>
                     </tr>
@@ -595,6 +600,7 @@ export function Account({ me, onLogout }) {
         </div>
         <Notice msg={adminMsg} />
       </section>
+      {me.user.is_admin && <div style={{ gridColumn: '1 / -1' }}><Settings /></div>}
     </div>
   )
 }

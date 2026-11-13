@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from './api.js'
 import { Logo, Notice } from './components.jsx'
 import { Account, Congress, France, Funds, Guide, Insiders, Live, Training } from './pages.jsx'
+import { StockPage } from './extra.jsx'
 
 const TABS = [
   ['live', 'Flux live', Live],
@@ -16,7 +17,8 @@ const TABS = [
 
 function useHashTab() {
   const read = () => {
-    const h = window.location.hash.replace('#', '')
+    const h = decodeURIComponent(window.location.hash.replace('#', ''))
+    if (h.startsWith('action/') && h.length > 7) return h
     return TABS.some(([k]) => k === h) ? h : 'live'
   }
   const [tab, setTab] = useState(read)
@@ -40,7 +42,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    const label = TABS.find(([k]) => k === tab)?.[1]
+    const label = tab.startsWith('action/') ? tab.slice(7) : TABS.find(([k]) => k === tab)?.[1]
     document.title = me ? `${label} · Sillage` : 'Sillage'
   }, [tab, me])
 
@@ -52,7 +54,8 @@ export default function App() {
   if (me === undefined) return <div className="auth"><p className="muted">Chargement…</p></div>
   if (me === null) return <Auth onDone={() => api('/auth/me').then(setMe)} />
 
-  const Page = TABS.find(([k]) => k === tab)[2]
+  const stock = tab.startsWith('action/') ? tab.slice(7).toUpperCase() : null
+  const Page = stock ? null : TABS.find(([k]) => k === tab)[2]
   return (
     <>
       <header className="topbar">
@@ -60,6 +63,10 @@ export default function App() {
           <Logo />
           <div><strong>Sillage</strong><br /><span>Suivez l'argent informé</span></div>
         </a>
+        <form className="inline" role="search" onSubmit={(e) => { e.preventDefault(); const t = e.target.q.value.trim().toUpperCase(); if (t) go('action/' + t) }}>
+          <label htmlFor="q" className="sr-only">Fiche d'une action</label>
+          <input id="q" name="q" type="search" size="7" placeholder="Ticker" />
+        </form>
         <nav className="tabs" aria-label="Sections">
           {TABS.map(([k, label]) => (
             <button key={k} type="button" className="tab" aria-current={tab === k ? 'page' : undefined} onClick={() => go(k)}>{label}</button>
@@ -67,7 +74,7 @@ export default function App() {
         </nav>
       </header>
       <main id="contenu">
-        <Page me={me} onLogout={logout} />
+        {stock ? <StockPage key={stock} ticker={stock} /> : <Page me={me} onLogout={logout} />}
       </main>
       <footer>
         Sillage affiche des déclarations publiques ({['SEC EDGAR', ...(me.congress_sources || []), ...(me.amf_enabled ? ['AMF'] : []), 'FINRA'].join(', ')}) avec retard.

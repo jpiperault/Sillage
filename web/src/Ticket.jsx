@@ -93,7 +93,7 @@ export default function Ticket({ id, onChanged }) {
         <SideBadge side={s.side} plan={s.plan_10b5_1} />
         <Score value={s.score} />
       </h2>
-      <div className="muted small">{s.company || ''}</div>
+      <div className="muted small">{s.company || ''}{s.ticker && <> · <a href={`#action/${s.ticker}`}>fiche de l'action</a></>}</div>
       <div>{s.person} <span className="muted">· {s.role}</span></div>
 
       <dl className="kv num">

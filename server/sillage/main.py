@@ -13,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import db, log, paper, security
+from . import alerts, backtest, db, log, paper, security, settings_store
 from .api import router
 from .config import ConfigError, Settings, load_settings
 from .ingest.prices import PriceClient
@@ -72,11 +72,23 @@ def create_app(settings: Settings) -> FastAPI:
         await pool.open(wait=False)
         app.state.pool = pool
         app.state.prices = PriceClient()
+        app.state.history = backtest.HistoryClient()
+        app.state.base_settings = settings
+        async with pool.connection() as conn:
+            app.state.settings = settings_store.apply(settings, await settings_store.load(conn))
         await _bootstrap_admin(settings, pool)
         app.state.ingestor = None
         if settings.ingest_enabled:
-            app.state.ingestor = Ingestor(settings, pool, app.state.prices)
+            from .api import _build_signals
+
+            async def recent_signals(conn):
+                return await _build_signals(conn, source="all", side="all", fast=False, days=14, ticker=None,
+                                            limit=5000)
+
+            app.state.ingestor = Ingestor(lambda: app.state.settings, pool, app.state.prices, recent_signals)
             app.state.ingestor.start()
+        app.state.linker = alerts.Linker(pool, lambda: app.state.settings.telegram_bot_token)
+        app.state.linker.start()
         _log.info("Sillage prêt sur le port %d (collecte %s, Congrès %s)", settings.port,
                   "active" if settings.ingest_enabled else "désactivée",
                   ", ".join(settings.congress_sources) or "inactif")
@@ -87,7 +99,9 @@ def create_app(settings: Settings) -> FastAPI:
             _log.info("arrêt demandé")
             if app.state.ingestor:
                 await app.state.ingestor.shutdown(timeout=1.0)
+            await app.state.linker.shutdown()
             await app.state.prices.close()
+            await app.state.history.close()
             try:
                 await asyncio.wait_for(pool.close(timeout=1.0), 1.5)
             except asyncio.TimeoutError:
