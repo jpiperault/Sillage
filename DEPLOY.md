@@ -11,7 +11,7 @@ avec un mode Entraînement en argent fictif. Un seul conteneur, état entièreme
 | Identifiant | `sillage` |
 | Adresse | `https://sillage.piperault.fr/` |
 | Image | `ghcr.io/jpiperault/sillage` |
-| Version | `1.0.0` (jamais `latest`) |
+| Version | la dernière publiée, au format `x.y.z` (ex. `1.2.0`) — **jamais `latest`**, ce tag n'est pas publié |
 | Port interne | `8080` |
 | Healthcheck | `GET /health` → `200 ok` (503 si la base est inaccessible) |
 | Mémoire | 384 Mo (mesuré : ~50 Mo au repos, ~60-70 Mo pendant la collecte) |
@@ -24,10 +24,10 @@ avec un mode Entraînement en argent fictif. Un seul conteneur, état entièreme
 | Variable | Obligatoire | Rôle |
 |---|---|---|
 | `DATABASE_URL` | oui (Hangar) | `postgresql://user:mdp@hôte:5432/base` |
-| `JWT_SECRET` | oui | ≥ 32 caractères : `openssl rand -hex 32`. Le changer déconnecte tout le monde. |
+| `JWT_SECRET` | oui | Clé secrète qui signe les sessions de connexion (voir plus bas). ≥ 32 caractères : `openssl rand -hex 32`. |
 | `ADMIN_EMAIL` | oui | Adresse du compte administrateur (réservée : personne d'autre ne peut s'inscrire avec). |
 | `ADMIN_PASSWORD` | 1er démarrage | Crée le compte admin s'il n'existe pas : `openssl rand -base64 24`. Ignorée ensuite (changer le mot de passe dans l'onglet Compte). |
-| `SEC_USER_AGENT` | non | Défaut `Sillage/1.0 <ADMIN_EMAIL>`. La SEC exige un contact joignable. |
+| `SEC_USER_AGENT` | non | En-tête envoyé à sec.gov et house.gov. Défaut `Sillage/1.0 <ADMIN_EMAIL>` : **l'adresse admin part donc à la SEC** si cette variable est vide (voir plus bas). |
 | `HOUSE_ENABLED` | non | `true` par défaut : transactions des représentants lues dans les déclarations officielles du Greffe de la Chambre (gratuit). |
 | `QUIVER_API_KEY` | non | Ajoute Quiver Quantitative (payant), surtout utile pour le Sénat. Si `HOUSE_ENABLED` est actif, Quiver ne fournit que le Sénat (pas de doublon). |
 | `FORM144_ENABLED` | non | `true` par défaut : ventes annoncées par les initiés (SEC Form 144). |
@@ -42,6 +42,31 @@ avec un mode Entraînement en argent fictif. Un seul conteneur, état entièreme
 
 Une variable obligatoire absente arrête le démarrage avec un message qui la nomme et le code de sortie 2,
 par exemple : `démarrage impossible : variable(s) d'environnement obligatoire(s) manquante(s) : JWT_SECRET`.
+
+### `JWT_SECRET`
+
+Quand on se connecte, Sillage remet un jeton de session (JWT, dans un cookie, valable 30 jours) qui dit « compte n° X ».
+`JWT_SECRET` sert à le signer : sans cette clé, impossible de fabriquer ou de modifier un jeton (par exemple se faire
+passer pour l'admin). C'est un mot de passe que personne ne tape : on le génère une fois et on le garde.
+
+- Le garder secret : qui le connaît peut se faire passer pour n'importe quel compte.
+- Garder la même valeur d'une version à l'autre : le changer déconnecte tout le monde (utile seulement en cas de fuite).
+- Ce n'est pas le mot de passe admin (`ADMIN_PASSWORD`).
+
+### Données envoyées aux services extérieurs
+
+| Service | Ce qui est envoyé |
+|---|---|
+| sec.gov (Form 4, Form 144, 13D/13G, 13F, tickers) | `User-Agent: <SEC_USER_AGENT>`, par défaut `Sillage/1.0 <ADMIN_EMAIL>` |
+| disclosures-clerk.house.gov (élus) | le même en-tête |
+| AMF, FINRA, Yahoo, Nasdaq | en-tête de navigateur générique, aucune donnée personnelle |
+| OpenFIGI | en-tête par défaut de la bibliothèque HTTP + les CUSIP à convertir |
+| Quiver Quantitative (si clé) | la clé `QUIVER_API_KEY` |
+
+La SEC exige un contact joignable dans le `User-Agent` de tout robot (politique « fair access » d'EDGAR) et peut
+bloquer un robot qui n'en donne pas. L'adresse n'est pas publiée mais reste dans leurs journaux. Pour ne pas
+exposer l'adresse admin, définir `SEC_USER_AGENT` avec une adresse dédiée que l'on lit, par exemple
+`Sillage/1.0 sillage@piperault.fr`.
 
 ## Comportement en production
 
@@ -104,6 +129,19 @@ Tests :
 ```bash
 docker run --rm -v "$PWD/server":/src -w /src python:3.12-slim sh -c "pip install -q -r requirements.txt -r requirements-dev.txt && python -m pytest -q tests"
 ```
+
+## Dépannage Hangar
+
+| Symptôme | Cause | Solution |
+|---|---|---|
+| `ghcr.io/jpiperault/sillage:latest: not found` | le tag `latest` n'est jamais publié | indiquer une version `x.y.z` |
+| `…sillage:1.10: not found` | version mal saisie | les versions ont trois nombres : `1.2.0` |
+| conteneur qui redémarre, logs `démarrage impossible : … manquante(s) : JWT_SECRET, ADMIN_EMAIL` | variables absentes du conteneur | les ajouter dans Réglages, enregistrer, puis **redéployer** la version (elles sont lues à la création du conteneur) |
+| aucun compte pour se connecter | `ADMIN_PASSWORD` absente au premier démarrage | l'ajouter et redémarrer : le compte admin est créé s'il n'existe pas |
+| supprimer puis recréer l'application | les variables peuvent être perdues | les vérifier dans Réglages avant de déployer |
+
+Démarrage réussi : les logs montrent `migrations : N nouvelle(s)` puis `Sillage prêt sur le port 8080`, et `/health`
+répond `ok`.
 
 ## Limites connues
 
