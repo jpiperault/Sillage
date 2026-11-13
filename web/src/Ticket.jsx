@@ -141,7 +141,7 @@ export default function Ticket({ id, onChanged }) {
         <p className="muted">Pas de ticker coté pour cet émetteur : copie impossible.</p>
       )}
       <Notice msg={msg} />
-      {s.url && <p className="small"><a href={s.url} target="_blank" rel="noopener noreferrer">Voir le dépôt sur le site de la SEC ↗</a></p>}
+      {s.url && <p className="small"><a href={s.url} target="_blank" rel="noopener noreferrer">{s.source === 'insider' ? 'Voir le dépôt sur le site de la SEC ↗' : 'Voir la déclaration (Greffe de la Chambre) ↗'}</a></p>}
     </section>
   )
 }

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import db, log, paper
 from .config import Settings
-from .ingest import congress, prices, sec
+from .ingest import congress, house, prices, sec
 
 _log = log.get("jobs")
 
@@ -42,6 +42,7 @@ class Ingestor:
         self.pool = pool
         self.prices = price_client
         self.sec = sec.SecClient(settings.sec_user_agent)
+        self.house = house.HouseClient(settings.sec_user_agent)
         self.stop = asyncio.Event()
         self.wake = asyncio.Event()
         self.running = False
@@ -67,6 +68,7 @@ class Ingestor:
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):  # noqa: BLE001
                 pass
         await self.sec.close()
+        await self.house.close()
 
     async def _loop(self) -> None:
         await asyncio.sleep(2)  # laisse le serveur finir de démarrer
@@ -154,8 +156,21 @@ class Ingestor:
         async def ownership():
             return {"new": await sec.poll_ownership(self.sec, conn)}
 
+        async def house_index():
+            today = datetime.now(timezone.utc).date()
+            years = [today.year - 1, today.year] if today.month <= 2 else [today.year]
+            return {"queued": await house.poll_index(self.house, conn, years)}
+
+        async def house_queue():
+            stats = await house.process_queue(self.house, conn, stop=self.stop)
+            cur = await conn.execute("SELECT count(*) AS n FROM house_filings WHERE status='pending'")
+            stats["pending"] = (await cur.fetchone())["n"]
+            await conn.commit()
+            return stats
+
         async def congress_step():
-            return {"new": await congress.fetch_and_store(self.s.quiver_api_key, conn)}
+            return {"new": await congress.fetch_and_store(self.s.quiver_api_key, conn,
+                                                          skip_house=self.s.house_enabled)}
 
         async def prices_step():
             return await prices.refresh_all(self.pool, self.prices, stop=self.stop)
@@ -169,7 +184,10 @@ class Ingestor:
             await self._step(conn, "backfill", backfill)
         await self._step(conn, "form4_queue", form4_queue)
         await self._step(conn, "ownership", ownership)
-        if self.s.congress_enabled:
+        if self.s.house_enabled:
+            await self._step(conn, "house_index", house_index)
+            await self._step(conn, "house_queue", house_queue)
+        if self.s.quiver_api_key:
             await self._step(conn, "congress", congress_step)
         await self._step(conn, "prices", prices_step)
         await self._step(conn, "stops", stops)

@@ -28,7 +28,8 @@ avec un mode Entraînement en argent fictif. Un seul conteneur, état entièreme
 | `ADMIN_EMAIL` | oui | Adresse du compte administrateur (réservée : personne d'autre ne peut s'inscrire avec). |
 | `ADMIN_PASSWORD` | 1er démarrage | Crée le compte admin s'il n'existe pas : `openssl rand -base64 24`. Ignorée ensuite (changer le mot de passe dans l'onglet Compte). |
 | `SEC_USER_AGENT` | non | Défaut `Sillage/1.0 <ADMIN_EMAIL>`. La SEC exige un contact joignable. |
-| `QUIVER_API_KEY` | non | Active la source Congrès (Quiver Quantitative). |
+| `HOUSE_ENABLED` | non | `true` par défaut : transactions des représentants lues dans les déclarations officielles du Greffe de la Chambre (gratuit). |
+| `QUIVER_API_KEY` | non | Ajoute Quiver Quantitative (payant), surtout utile pour le Sénat. Si `HOUSE_ENABLED` est actif, Quiver ne fournit que le Sénat (pas de doublon). |
 | `ALLOW_SIGNUP` | non | `true` par défaut ; `false` ferme les inscriptions. |
 | `INGEST_ENABLED` | non | `true` par défaut. |
 | `INGEST_INTERVAL_MIN` | non | 10 par défaut. |
@@ -102,7 +103,10 @@ docker run --rm -v "$PWD/server":/src -w /src python:3.12-slim sh -c "pip instal
 
 ## Limites connues
 
-- Source Congrès jamais testée avec une vraie clé (format Quiver lu de façon tolérante).
+- Élus : la Chambre vient du Greffe (PTR déposés en ligne, actions cotées seulement ; ~99 % des lignes lues sur 45 PTR
+  testés, les lignes coupées entre deux pages du PDF sont perdues ; PTR papier scannés ignorés ; pas de parti politique).
+  Le Sénat n'est couvert qu'avec `QUIVER_API_KEY`, source jamais testée avec une vraie clé.
+- Premier démarrage : ~470 PTR de l'année en file, lus par 150 à chaque cycle (environ 1 min par cycle).
 - Cours non officiels : Yahoo, puis Nasdaq en secours (Yahoo renvoie 429 depuis certaines adresses IP de serveur).
 - Pas encore d'alertes Telegram, de 13F ni de données AMF.
 - Une même déclaration Form 4 peut produire plusieurs lignes (une par transaction).

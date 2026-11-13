@@ -219,7 +219,7 @@ def test_missing_variable_is_named():
     assert "JWT_SECRET" in str(exc.value)
     s = load_settings({"DATABASE_URL": "postgresql://x", "ADMIN_EMAIL": "A@B.test", "JWT_SECRET": "x" * 32})
     assert s.admin_email == "a@b.test" and s.sec_user_agent == "Sillage/1.0 a@b.test"
-    assert s.paper_start_cash == 25000 and not s.congress_enabled
+    assert s.paper_start_cash == 25000 and s.congress_enabled and not s.quiver_api_key
 
 
 def test_price_parsers():

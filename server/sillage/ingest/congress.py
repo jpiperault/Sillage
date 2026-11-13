@@ -84,7 +84,13 @@ def normalize(row: dict) -> dict | None:
     }
 
 
-async def fetch_and_store(api_key: str, conn, transport: httpx.AsyncBaseTransport | None = None) -> int:
+def is_house(row: dict) -> bool:
+    return "rep" in str(_first(row, "House", "Chamber") or "").lower()
+
+
+async def fetch_and_store(api_key: str, conn, transport: httpx.AsyncBaseTransport | None = None,
+                          skip_house: bool = False) -> int:
+    """skip_house : la Chambre vient déjà du Greffe ; Quiver ne sert alors que pour le Sénat (pas de doublon)."""
     async with httpx.AsyncClient(timeout=30, transport=transport) as client:
         resp = await client.get(QUIVER_URL, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
         resp.raise_for_status()
@@ -93,7 +99,7 @@ async def fetch_and_store(api_key: str, conn, transport: httpx.AsyncBaseTranspor
         raise ValueError("réponse Quiver inattendue (liste attendue)")
     new = 0
     for row in data:
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or (skip_house and is_house(row)):
             continue
         n = normalize(row)
         if n is None:

@@ -69,7 +69,7 @@ export default function App() {
         <Page me={me} onLogout={logout} />
       </main>
       <footer>
-        Sillage affiche des déclarations publiques (SEC EDGAR{me.congress_enabled ? ', Quiver Quantitative' : ''}) avec retard.
+        Sillage affiche des déclarations publiques ({['SEC EDGAR', ...(me.congress_sources || [])].join(', ')}) avec retard.
         Ce n'est pas un conseil en investissement : vous décidez et passez vos ordres vous-même. Cours indicatifs, non officiels.
       </footer>
     </>

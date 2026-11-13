@@ -79,7 +79,7 @@ def create_app(settings: Settings) -> FastAPI:
             app.state.ingestor.start()
         _log.info("Sillage prêt sur le port %d (collecte %s, Congrès %s)", settings.port,
                   "active" if settings.ingest_enabled else "désactivée",
-                  "actif" if settings.congress_enabled else "inactif")
+                  ", ".join(settings.congress_sources) or "inactif")
         try:
             yield
         finally:

@@ -201,8 +201,8 @@ export function Insiders() {
 function CongressOff() {
   return (
     <div className="notice">
-      La source Congrès est inactive. L'administrateur doit ajouter la variable <code>QUIVER_API_KEY</code> (clé
-      Quiver Quantitative) pour suivre les transactions des parlementaires américains.
+      La source Congrès est désactivée. L'administrateur peut la réactiver (variable <code>HOUSE_ENABLED</code>,
+      déclarations officielles de la Chambre, gratuites) et/ou ajouter <code>QUIVER_API_KEY</code> pour le Sénat.
     </div>
   )
 }
@@ -213,20 +213,23 @@ export function Congress({ me }) {
   const [selected, setSelected] = useState(null)
   const feed = useApi(me.congress_enabled ? '/signals' + qs({ source: 'congress', side, days: 90, sort: 'date', limit: 200 }) : null)
   if (!me.congress_enabled) return <section className="panel"><h2>Élus</h2><CongressOff /></section>
+  const hasParty = (ranking.data?.items || []).some((r) => r.party)
   return (
     <div className="grid-live">
       <div>
         <section className="panel" aria-label="Classement des élus">
-          <h2>Classement <span className="muted small">12 derniers mois</span></h2>
+          <h2>Classement <span className="muted small">12 derniers mois · {(me.congress_sources || []).join(', ')}</span></h2>
+          {!(me.congress_sources || []).includes('Quiver Quantitative') &&
+            <p className="muted small">Représentants seulement (déclarations du Greffe de la Chambre, actions cotées). Le Sénat nécessite <code>QUIVER_API_KEY</code>.</p>}
           {!ranking.data?.items?.length ? <p className="muted">Pas encore de données.</p> : (
             <div className="table-wrap">
               <table>
-                <thead><tr><th>Élu</th><th>Parti</th><th>Chambre</th><th className="r">Trades</th><th className="r">Achats</th>
+                <thead><tr><th>Élu</th>{hasParty && <th>Parti</th>}<th>Circonscription</th><th className="r">Trades</th><th className="r">Achats</th>
                   <th className="r">Ventes</th><th className="r">Volume min.</th><th className="r">Délai moyen</th><th>Dernière</th></tr></thead>
                 <tbody>
                   {ranking.data.items.map((r) => (
                     <tr key={r.politician}>
-                      <td>{r.politician}</td><td>{r.party || '—'}</td><td>{r.chamber || '—'}</td>
+                      <td>{r.politician}</td>{hasParty && <td>{r.party || '—'}</td>}<td>{r.state_dst || r.chamber || '—'}</td>
                       <td className="r num">{r.trades}</td><td className="r num up">{r.buys}</td><td className="r num sell">{r.sells}</td>
                       <td className="r num">{money(r.volume_min)}</td>
                       <td className="r num">{r.avg_delay != null ? `${Math.round(r.avg_delay)} j` : '—'}</td>
@@ -307,7 +310,7 @@ export function Guide() {
           <dt>13D / 13G</dt>
           <dd>Un investisseur franchit 5 % du capital. 13D = intention active (activisme, prise de contrôle), 13G = passif.</dd>
           <dt>Élus (Congrès)</dt>
-          <dd>Les parlementaires américains déclarent leurs trades jusqu'à 45 jours après, par tranches de montant. Source Quiver Quantitative.</dd>
+          <dd>Les parlementaires américains déclarent leurs trades jusqu'à 45 jours après, par tranches de montant. Représentants : déclarations officielles du Greffe de la Chambre (PTR déposés en ligne). Sénat : seulement avec une clé Quiver Quantitative.</dd>
         </dl>
       </section>
       <section className="panel">
@@ -400,11 +403,12 @@ export function Account({ me, onLogout }) {
           <>
             <p className="muted small">
               Collecte {st.ingest_enabled ? `toutes les ${st.interval_min} min` : 'désactivée'}
-              {st.ingest_running && ' · en cours'} · Congrès {st.congress_enabled ? 'actif' : 'inactif'}
+              {st.ingest_running && ' · en cours'} · Congrès : {st.congress_enabled ? st.congress_sources.join(', ') : 'inactif'}
             </p>
             <div className="stats num">
               <div className="stat"><div className="label">Transactions</div><div className="value">{int(st.counts.insider_trades)}</div></div>
               <div className="stat"><div className="label">Dépôts en file</div><div className="value">{int(st.counts.filings_pending)}</div></div>
+              <div className="stat"><div className="label">Trades d'élus</div><div className="value">{int(st.counts.congress_trades)}</div></div>
               <div className="stat"><div className="label">13D/13G</div><div className="value">{int(st.counts.ownership_filings)}</div></div>
               <div className="stat"><div className="label">Tickers connus</div><div className="value">{int(st.counts.tickers)}</div></div>
             </div>

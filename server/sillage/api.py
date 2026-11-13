@@ -149,6 +149,7 @@ async def logout(response: Response):
 async def me(request: Request, user: dict = Depends(current_user)):
     st = _state(request).settings
     return {"user": _public_user(user), "congress_enabled": st.congress_enabled,
+            "congress_sources": st.congress_sources,
             "paper_start_cash": st.paper_start_cash}
 
 
@@ -251,19 +252,22 @@ def _congress_signal(r: dict, cluster: int, current: float | None) -> dict:
     delay = scoring.days_between(r["trade_date"], r["report_date"])
     score, reasons = scoring.congress_score(side=r["side"], amount_min=_f(r["amount_min"]), delay_days=delay,
                                             cluster=cluster)
-    role = " · ".join(x for x in (r["chamber"], r["party"]) if x) or "Élu"
+    chamber = {"House": "Représentant", "Senate": "Sénateur"}.get(r["chamber"] or "", r["chamber"])
+    role = " · ".join(x for x in (chamber, r["party"], r.get("state_dst")) if x) or "Élu"
     return {
         "id": f"c{r['id']}", "source": "congress", "ticker": r["ticker"], "company": None,
         "person": r["politician"], "role": role, "side": r["side"], "code": None, "shares": None, "price": None,
         "value": _f(r["amount_min"]), "amount_range": r["amount_range"], "trade_date": r["trade_date"],
         "filed_date": r["report_date"], "delay_days": delay, "plan_10b5_1": False, "cluster": cluster,
-        "score": score, "reasons": reasons, "current_price": current, "change_pct": None, "url": None,
+        "score": score, "reasons": reasons, "current_price": current, "change_pct": None, "url": r.get("url"),
+        "congress_source": r.get("source"),
     }
 
 
 INSIDER_COLS = ("id, accession, ticker, issuer_name, owner_name, is_director, is_officer, is_ten_percent,"
                 " officer_title, code, shares, price, value, trade_date, filed_date, plan_10b5_1, url")
-CONGRESS_COLS = ("id, politician, party, chamber, ticker, side, amount_range, amount_min, trade_date, report_date")
+CONGRESS_COLS = ("id, source, politician, party, chamber, ticker, side, amount_range, amount_min, trade_date,"
+                 " report_date, url, raw->>'state_dst' AS state_dst")
 
 
 async def _build_signals(conn, *, source: str, side: str, fast: bool, days: int, ticker: str | None,
@@ -430,7 +434,7 @@ async def congress_ranking(request: Request, user: dict = Depends(current_user))
     st = _state(request)
     async with st.pool.connection() as conn:
         cur = await conn.execute(
-            """SELECT politician, max(party) AS party, max(chamber) AS chamber, count(*) AS trades,
+            """SELECT politician, max(party) AS party, max(chamber) AS chamber, max(raw->>'state_dst') AS state_dst, count(*) AS trades,
                       count(*) FILTER (WHERE side='buy') AS buys, count(*) FILTER (WHERE side='sell') AS sells,
                       coalesce(sum(amount_min),0) AS volume_min, max(report_date) AS last_report,
                       avg(report_date - trade_date) FILTER (WHERE report_date IS NOT NULL AND trade_date IS NOT NULL)
@@ -466,6 +470,7 @@ async def status(request: Request, user: dict = Depends(current_user)):
                       (SELECT count(*) FROM sec_filings WHERE status='error') AS filings_error,
                       (SELECT count(*) FROM ownership_filings) AS ownership_filings,
                       (SELECT count(*) FROM congress_trades) AS congress_trades,
+                      (SELECT count(*) FROM house_filings WHERE status='pending') AS house_pending,
                       (SELECT count(*) FROM cik_tickers) AS tickers,
                       (SELECT count(*) FROM prices) AS prices,
                       (SELECT max(filed_date) FROM insider_trades) AS last_filed"""
@@ -480,6 +485,7 @@ async def status(request: Request, user: dict = Depends(current_user)):
         "ingest_running": bool(ing and ing.running),
         "interval_min": st.settings.ingest_interval_min,
         "congress_enabled": st.settings.congress_enabled,
+        "congress_sources": st.settings.congress_sources,
     }
 
 

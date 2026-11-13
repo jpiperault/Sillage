@@ -36,6 +36,7 @@ class Settings:
     admin_password: str | None
     sec_user_agent: str
     quiver_api_key: str | None
+    house_enabled: bool
     allow_signup: bool
     ingest_enabled: bool
     ingest_interval_min: int
@@ -45,7 +46,16 @@ class Settings:
 
     @property
     def congress_enabled(self) -> bool:
-        return bool(self.quiver_api_key)
+        return self.house_enabled or bool(self.quiver_api_key)
+
+    @property
+    def congress_sources(self) -> list[str]:
+        out = []
+        if self.house_enabled:
+            out.append("Greffe de la Chambre")
+        if self.quiver_api_key:
+            out.append("Quiver Quantitative")
+        return out
 
 
 def load_settings(env: dict | None = None) -> Settings:
@@ -80,6 +90,7 @@ def load_settings(env: dict | None = None) -> Settings:
         admin_password=admin_password,
         sec_user_agent=(env.get("SEC_USER_AGENT") or "").strip() or f"Sillage/1.0 {admin_email}",
         quiver_api_key=(env.get("QUIVER_API_KEY") or "").strip() or None,
+        house_enabled=_bool(env.get("HOUSE_ENABLED"), True),
         allow_signup=_bool(env.get("ALLOW_SIGNUP"), True),
         ingest_enabled=_bool(env.get("INGEST_ENABLED"), True),
         ingest_interval_min=_int(env, "INGEST_INTERVAL_MIN", 10, minimum=1),
