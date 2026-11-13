@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import db, log, paper
 from .config import Settings
-from .ingest import congress, house, prices, sec
+from .ingest import amf, congress, finra, funds, house, prices, sec
 
 _log = log.get("jobs")
 
@@ -43,6 +43,7 @@ class Ingestor:
         self.prices = price_client
         self.sec = sec.SecClient(settings.sec_user_agent)
         self.house = house.HouseClient(settings.sec_user_agent)
+        self.amf = amf.AmfClient()
         self.stop = asyncio.Event()
         self.wake = asyncio.Event()
         self.running = False
@@ -69,6 +70,7 @@ class Ingestor:
                 pass
         await self.sec.close()
         await self.house.close()
+        await self.amf.close()
 
     async def _loop(self) -> None:
         await asyncio.sleep(2)  # laisse le serveur finir de démarrer
@@ -168,6 +170,42 @@ class Ingestor:
             await conn.commit()
             return stats
 
+        async def form144_feed():
+            return {"queued": await sec.poll_feed(self.sec, conn, "144")}
+
+        async def form144_queue():
+            stats = await sec.process_queue(self.sec, conn, limit=200, stop=self.stop, form="144")
+            cur = await conn.execute("SELECT count(*) AS n FROM sec_filings WHERE status='pending' AND form_type='144'")
+            stats["pending"] = (await cur.fetchone())["n"]
+            await conn.commit()
+            stats["notices"] = stats.pop("trades")
+            return stats
+
+        async def amf_list():
+            return {"queued": await amf.poll_list(self.amf, conn)}
+
+        async def amf_queue():
+            stats = await amf.process_queue(self.amf, conn, stop=self.stop)
+            cur = await conn.execute("SELECT count(*) AS n FROM amf_filings WHERE status='pending'")
+            stats["pending"] = (await cur.fetchone())["n"]
+            await conn.commit()
+            return stats
+
+        async def funds_13f():
+            st = await job_info(conn, "funds_13f")
+            last = st["last_ok_at"]
+            if last and datetime.now(timezone.utc) - last < timedelta(hours=6):
+                return {"skipped": True}
+            res = await funds.refresh_all(self.sec, conn, self.s.funds_13f, stop=self.stop)
+            res["skipped"] = False
+            return res
+
+        async def cusips():
+            return await funds.map_cusips(conn)
+
+        async def short_volume():
+            return await finra.refresh(conn)
+
         async def congress_step():
             return {"new": await congress.fetch_and_store(self.s.quiver_api_key, conn,
                                                           skip_house=self.s.house_enabled)}
@@ -183,11 +221,22 @@ class Ingestor:
         if self.s.backfill_days > 0:
             await self._step(conn, "backfill", backfill)
         await self._step(conn, "form4_queue", form4_queue)
+        if self.s.form144_enabled:
+            await self._step(conn, "form144_feed", form144_feed)
+            await self._step(conn, "form144_queue", form144_queue)
         await self._step(conn, "ownership", ownership)
         if self.s.house_enabled:
             await self._step(conn, "house_index", house_index)
             await self._step(conn, "house_queue", house_queue)
         if self.s.quiver_api_key:
             await self._step(conn, "congress", congress_step)
+        if self.s.amf_enabled:
+            await self._step(conn, "amf_list", amf_list)
+            await self._step(conn, "amf_queue", amf_queue)
+        if self.s.funds_13f:
+            await self._step(conn, "funds_13f", funds_13f)
+            await self._step(conn, "cusips", cusips)
+        if self.s.finra_enabled:
+            await self._step(conn, "short_volume", short_volume)
         await self._step(conn, "prices", prices_step)
         await self._step(conn, "stops", stops)

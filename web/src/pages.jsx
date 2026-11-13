@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { api } from './api.js'
 import { Notice, Score, Seg, SignalTable, useApi } from './components.jsx'
 import Ticket from './Ticket.jsx'
-import { date, datetime, int, money, pct, signed, tone, usd } from './format.js'
+import { date, datetime, int, money, moneyCur, pct, signed, tone, usd } from './format.js'
 
 const DAYS = [['3', '3 j'], ['7', '7 j'], ['30', '30 j'], ['90', '90 j']]
 
@@ -29,7 +29,7 @@ export function Live({ me }) {
         <h2>Flux live</h2>
         <div className="filters">
           <Seg label="Source" value={source} onChange={setSource}
-            options={[['all', 'Tous'], ['insider', 'Initiés'], ['congress', 'Élus']]} />
+            options={[['all', 'Tous'], ['insider', 'Initiés'], ['congress', 'Élus'], ...(me.amf_enabled ? [['amf', 'France']] : [])]} />
           <Seg label="Sens" value={side} onChange={setSide}
             options={[['all', 'Tous'], ['buy', 'Achats'], ['sell', 'Ventes'], ['option', 'Options']]} />
           <Seg label="Période" value={days} onChange={setDays} options={DAYS} />
@@ -175,24 +175,72 @@ function Stat({ label, value, cls = '' }) {
 /* ------------------------------------------------------------ Insiders */
 
 export function Insiders() {
+  return <InsiderFeed source="insider" title="Insiders" subtitle="dirigeants, administrateurs, actionnaires > 10 % (SEC Form 4)" withNotices />
+}
+
+export function France() {
+  return <InsiderFeed source="amf" title="France" subtitle="déclarations des dirigeants des sociétés cotées françaises (AMF), achats et ventes d'actions" />
+}
+
+function InsiderFeed({ source, title, subtitle, withNotices = false }) {
   const [side, setSide] = useState('all')
   const [days, setDays] = useState('30')
   const [selected, setSelected] = useState(null)
-  const { data, error } = useApi('/signals' + qs({ source: 'insider', side, days, sort: 'date', limit: 300 }))
+  const { data, error } = useApi('/signals' + qs({ source, side, days, sort: 'date', limit: 300 }))
+  const sides = source === 'amf' ? [['all', 'Tous'], ['buy', 'Achats'], ['sell', 'Ventes']]
+    : [['all', 'Tous'], ['buy', 'Achats'], ['sell', 'Ventes'], ['option', 'Options']]
   return (
     <div className="grid-live">
-      <section className="panel" aria-label="Transactions d'initiés">
-        <h2>Insiders <span className="muted small">dirigeants, administrateurs, actionnaires &gt; 10 % (SEC Form 4)</span></h2>
+      <div>
+      <section className="panel" aria-label={title}>
+        <h2>{title} <span className="muted small">{subtitle}</span></h2>
         <div className="filters">
-          <Seg label="Sens" value={side} onChange={setSide}
-            options={[['all', 'Tous'], ['buy', 'Achats'], ['sell', 'Ventes'], ['option', 'Options']]} />
+          <Seg label="Sens" value={side} onChange={setSide} options={sides} />
           <Seg label="Période" value={days} onChange={setDays} options={DAYS} />
         </div>
         <Notice msg={error && { type: 'error', text: error }} />
         <SignalTable items={data?.items} selected={selected} onSelect={setSelected} showSource={false} />
       </section>
+      {withNotices && <Notices />}
+      </div>
       <div className="side-col"><Ticket id={selected} /></div>
     </div>
+  )
+}
+
+function Notices() {
+  const [days, setDays] = useState('7')
+  const [min, setMin] = useState('100000')
+  const { data, error } = useApi('/notices' + qs({ days, min_value: min }))
+  return (
+    <section className="panel" aria-label="Ventes annoncées (Form 144)">
+      <h2>Ventes annoncées <span className="muted small">Form 144 : un initié prévient avant de vendre</span></h2>
+      <div className="filters">
+        <Seg label="Période" value={days} onChange={setDays} options={[['3', '3 j'], ['7', '7 j'], ['30', '30 j']]} />
+        <Seg label="Montant" value={min} onChange={setMin} options={[['0', 'Tous'], ['100000', '≥ 100 K$'], ['1000000', '≥ 1 M$']]} />
+      </div>
+      <Notice msg={error && { type: 'error', text: error }} />
+      {!data?.items?.length ? <p className="empty">Aucune vente annoncée pour ces filtres.</p> : (
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Déposé</th><th>Ticker</th><th>Qui</th><th className="r">Montant</th><th className="r">% du capital</th><th>Vente prévue</th><th></th></tr></thead>
+            <tbody>
+              {data.items.map((n) => (
+                <tr key={n.accession}>
+                  <td className="num">{date(n.filed_date)}</td>
+                  <td className="ticker">{n.ticker || '—'}</td>
+                  <td className="wrap"><div>{n.person}</div><div className="muted small">{n.relationship || '—'} · {n.issuer_name}</div></td>
+                  <td className="r num">{money(n.market_value)}</td>
+                  <td className="r num">{n.pct_outstanding != null ? pct(n.pct_outstanding, false) : '—'}</td>
+                  <td className="num">{date(n.approx_sale_date)}{n.plan_10b5_1 && <> <span className="badge plan">10b5-1</span></>}</td>
+                  <td>{n.url && <a href={n.url} target="_blank" rel="noopener noreferrer">SEC ↗</a>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   )
 }
 
@@ -256,7 +304,107 @@ export function Congress({ me }) {
 
 /* ------------------------------------------------------------ Fonds */
 
-export function Funds() {
+export function Funds({ me }) {
+  const [view, setView] = useState('13f')
+  if (!me.funds_13f_enabled) return <Ownership />
+  return (
+    <>
+      <div className="filters">
+        <Seg label="Vue" value={view} onChange={setView} options={[['13f', 'Grands fonds (13F)'], ['13d', 'Franchissements (13D/13G)']]} />
+      </div>
+      {view === '13f' ? <Funds13F /> : <Ownership />}
+    </>
+  )
+}
+
+const MOVE_LABEL = { new: 'Nouvelle', added: 'Renforcée', reduced: 'Allégée', sold: 'Soldée', held: 'Inchangée' }
+const MOVE_CLASS = { new: 'buy', added: 'buy', reduced: 'sell', sold: 'sell', held: 'option' }
+
+function Funds13F() {
+  const list = useApi('/funds13f')
+  const consensus = useApi('/funds13f/consensus')
+  const [cik, setCik] = useState(null)
+  const [filter, setFilter] = useState('moves')
+  const current = cik ?? list.data?.items?.find((f) => f.period)?.cik ?? null
+  const detail = useApi(current ? `/funds13f/${current}` : null)
+  const moves = (detail.data?.moves || []).filter((m) => (filter === 'moves' ? m.status !== 'held' : true))
+  return (
+    <div className="grid-live">
+      <div>
+        <section className="panel" aria-label="Mouvements du fonds">
+          <h2>Mouvements du dernier trimestre
+            {detail.data && <span className="muted small"> {detail.data.filings[0].fund_name} · trimestre au {date(detail.data.filings[0].period)}, déposé le {date(detail.data.filings[0].filed_date)}</span>}
+          </h2>
+          <p className="muted small">Les 13F arrivent jusqu'à 45 jours après la fin du trimestre : ce sont des mouvements anciens, à lire comme une conviction de long terme.</p>
+          <div className="filters">
+            <Seg label="Afficher" value={filter} onChange={setFilter} options={[['moves', 'Mouvements'], ['all', 'Tout le portefeuille']]} />
+          </div>
+          {!current ? <p className="empty">Aucun 13F collecté pour l'instant (première collecte en cours).</p> :
+            !moves.length ? <p className="empty">{detail.loading ? 'Chargement…' : 'Aucun mouvement.'}</p> : (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Mouvement</th><th>Ticker</th><th>Société</th><th className="r">Actions</th><th className="r">Variation</th><th className="r">Valeur</th><th className="r">Poids</th></tr></thead>
+                <tbody>
+                  {moves.map((m) => (
+                    <tr key={m.cusip + m.put_call}>
+                      <td><span className={`badge ${MOVE_CLASS[m.status]}`}>{MOVE_LABEL[m.status]}</span>{m.put_call && <span className="muted small"> {m.put_call}</span>}</td>
+                      <td className="ticker">{m.ticker || '—'}</td>
+                      <td className="wrap">{m.issuer}</td>
+                      <td className="r num">{int(m.shares ?? 0)}</td>
+                      <td className={`r num ${tone(m.change_pct)}`}>{m.status === 'new' ? 'nouvelle' : m.status === 'sold' ? `−${int(m.prev_shares)}` : pct(m.change_pct)}</td>
+                      <td className="r num">{money(m.value ?? 0)}</td>
+                      <td className="r num">{m.weight_pct != null ? pct(m.weight_pct, false) : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+        <section className="panel" aria-label="Achats partagés">
+          <h2>Achats partagés <span className="muted small">titres achetés ou renforcés par au moins 2 fonds suivis</span></h2>
+          {!consensus.data?.items?.length ? <p className="muted">Pas encore assez de données (il faut deux trimestres par fonds).</p> : (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Ticker</th><th>Société</th><th className="r">Acheteurs</th><th className="r">Vendeurs</th><th>Fonds acheteurs</th></tr></thead>
+                <tbody>
+                  {consensus.data.items.map((c) => (
+                    <tr key={c.cusip}>
+                      <td className="ticker">{c.ticker || '—'}</td><td className="wrap">{c.issuer}</td>
+                      <td className="r num up">{c.buyers.length}</td><td className="r num sell">{c.sellers.length}</td>
+                      <td className="wrap small muted">{c.buyers.map((b) => b.fund.split(' (')[0]).join(', ')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </div>
+      <section className="panel side-col" aria-label="Fonds suivis">
+        <h2>Fonds suivis</h2>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Fonds</th><th className="r">Portefeuille</th></tr></thead>
+            <tbody>
+              {(list.data?.items || []).map((f) => (
+                <tr key={f.cik} className={`clickable ${current === f.cik ? 'selected' : ''}`} onClick={() => f.period && setCik(f.cik)}>
+                  <td className="wrap">
+                    <button type="button" className="row-btn" disabled={!f.period} onClick={(e) => { e.stopPropagation(); setCik(f.cik) }}>{f.fund_name}</button>
+                    <div className="muted small">{f.period ? `au ${date(f.period)} · ${int(f.positions)} lignes` : 'pas encore collecté'}</div>
+                  </td>
+                  <td className="r num">{f.total_value ? money(f.total_value) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function Ownership() {
   const [form, setForm] = useState('all')
   const [days, setDays] = useState('30')
   const { data, error } = useApi('/funds' + qs({ form, days }))
@@ -307,6 +455,14 @@ export function Guide() {
           <dd>Transaction programmée des mois à l'avance : elle ne dit rien de l'information actuelle de l'initié. Pénalité de −20.</dd>
           <dt>Cluster</dt>
           <dd>Plusieurs initiés différents qui achètent la même action en 30 jours : signal nettement plus fiable.</dd>
+          <dt>Form 144</dt>
+          <dd>Un initié qui veut vendre des actions « restreintes » doit l'annoncer à la SEC le jour où il passe l'ordre. C'est une vente à venir, souvent avant le Form 4. Seulement affiché, sans score.</dd>
+          <dt>France (AMF)</dt>
+          <dd>Les dirigeants des sociétés françaises déclarent leurs opérations à l'AMF sous 3 jours ouvrés. Mêmes règles de score que les initiés américains, montants en euros. Pas de copie en fictif (portefeuille en dollars).</dd>
+          <dt>13F</dt>
+          <dd>Les gérants de plus de 100 M$ publient leurs positions américaines chaque trimestre, jusqu'à 45 jours après. Sillage suit une liste de grands fonds et montre leurs nouvelles lignes, renforcements, allègements et ventes.</dd>
+          <dt>Ventes à découvert (FINRA)</dt>
+          <dd>Part du volume quotidien vendu à découvert, affichée dans le ticket à titre d'information. Ce n'est pas la position vendeuse totale.</dd>
           <dt>13D / 13G</dt>
           <dd>Un investisseur franchit 5 % du capital. 13D = intention active (activisme, prise de contrôle), 13G = passif.</dd>
           <dt>Élus (Congrès)</dt>
@@ -409,6 +565,10 @@ export function Account({ me, onLogout }) {
               <div className="stat"><div className="label">Transactions</div><div className="value">{int(st.counts.insider_trades)}</div></div>
               <div className="stat"><div className="label">Dépôts en file</div><div className="value">{int(st.counts.filings_pending)}</div></div>
               <div className="stat"><div className="label">Trades d'élus</div><div className="value">{int(st.counts.congress_trades)}</div></div>
+              <div className="stat"><div className="label">Form 144</div><div className="value">{int(st.counts.sale_notices)}</div></div>
+              <div className="stat"><div className="label">AMF</div><div className="value">{int(st.counts.amf_trades)}</div></div>
+              <div className="stat"><div className="label">13F</div><div className="value">{int(st.counts.fund_filings)}</div></div>
+              <div className="stat"><div className="label">Jours FINRA</div><div className="value">{int(st.counts.short_days)}</div></div>
               <div className="stat"><div className="label">13D/13G</div><div className="value">{int(st.counts.ownership_filings)}</div></div>
               <div className="stat"><div className="label">Tickers connus</div><div className="value">{int(st.counts.tickers)}</div></div>
             </div>

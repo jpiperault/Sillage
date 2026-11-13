@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from './api.js'
 import { Notice, Score, SideBadge, useApi } from './components.jsx'
-import { date, money, pct, tone, usd } from './format.js'
+import { date, moneyCur, pct, priceCur, tone, usd } from './format.js'
 
 const STOP = 0.08
 
@@ -97,19 +97,37 @@ export default function Ticket({ id, onChanged }) {
       <div>{s.person} <span className="muted">· {s.role}</span></div>
 
       <dl className="kv num">
-        <dt>Prix au trade</dt><dd>{s.price ? usd(s.price) : '—'}</dd>
-        <dt>Cours actuel</dt>
-        <dd>{price ? usd(price) : 'indisponible'}{s.quote?.stale && <span className="muted small"> (ancien)</span>}</dd>
-        <dt>Depuis le trade</dt><dd className={tone(s.change_pct)}>{pct(s.change_pct)}</dd>
+        <dt>Prix au trade</dt><dd>{s.price ? priceCur(s.price, s.currency) : '—'}</dd>
+        {s.source !== 'amf' && <>
+          <dt>Cours actuel</dt>
+          <dd>{price ? usd(price) : 'indisponible'}{s.quote?.stale && <span className="muted small"> (ancien)</span>}</dd>
+          <dt>Depuis le trade</dt><dd className={tone(s.change_pct)}>{pct(s.change_pct)}</dd>
+        </>}
+        {s.isin && <><dt>ISIN</dt><dd>{s.isin}</dd></>}
+        {s.venue && <><dt>Lieu</dt><dd className="small">{s.venue}</dd></>}
         <dt>Date du trade</dt><dd>{date(s.trade_date)}</dd>
         <dt>Déclaré le</dt><dd>{date(s.filed_date)}</dd>
         <dt>Délai de déclaration</dt><dd>{s.delay_days != null ? `${s.delay_days} j` : '—'}</dd>
-        <dt>Montant</dt><dd>{s.amount_range || money(s.value)}</dd>
+        <dt>Montant</dt><dd>{s.amount_range || moneyCur(s.value, s.currency)}</dd>
         {s.shares != null && <><dt>Actions</dt><dd>{Math.round(s.shares).toLocaleString('fr-FR')}</dd></>}
       </dl>
 
       <h3>Pourquoi ce score</h3>
       <ul className="reasons">{s.reasons.map((r) => <li key={r}>{r}</li>)}</ul>
+
+      {s.notices?.length > 0 && (
+        <>
+          <h3>Ventes annoncées (Form 144)</h3>
+          <ul className="reasons">
+            {s.notices.map((n) => (
+              <li key={n.accession}>
+                {date(n.filed_date)} : {n.person}{n.relationship ? ` (${n.relationship})` : ''}, {moneyCur(n.market_value)}
+                {n.approx_sale_date ? `, vente prévue le ${date(n.approx_sale_date)}` : ''}{n.plan_10b5_1 ? ', plan 10b5-1' : ''}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
 
       {s.ticker ? (
         <>
@@ -138,10 +156,14 @@ export default function Ticket({ id, onChanged }) {
           </div>
         </>
       ) : (
-        <p className="muted">Pas de ticker coté pour cet émetteur : copie impossible.</p>
+        <p className="muted">
+          {s.source === 'amf'
+            ? `Action française : le portefeuille fictif est en dollars et ne la couvre pas. Pour la copier, passez l'ordre chez votre broker${s.isin ? ` (ISIN ${s.isin})` : ''}.`
+            : 'Pas de ticker coté pour cet émetteur : copie impossible.'}
+        </p>
       )}
       <Notice msg={msg} />
-      {s.url && <p className="small"><a href={s.url} target="_blank" rel="noopener noreferrer">{s.source === 'insider' ? 'Voir le dépôt sur le site de la SEC ↗' : 'Voir la déclaration (Greffe de la Chambre) ↗'}</a></p>}
+      {s.url && <p className="small"><a href={s.url} target="_blank" rel="noopener noreferrer">{{ insider: 'Voir le dépôt sur le site de la SEC ↗', amf: "Voir la déclaration sur le site de l'AMF ↗" }[s.source] || 'Voir la déclaration (Greffe de la Chambre) ↗'}</a></p>}
     </section>
   )
 }

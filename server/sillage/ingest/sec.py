@@ -143,29 +143,33 @@ def index_url(cik: int | str, accession: str) -> str:
     return FILING_INDEX_URL.format(cik=int(cik), acc_nodash=accession.replace("-", ""), acc=accession)
 
 
-async def _enqueue(conn, accession: str, url: str, filed: date | None) -> bool:
+async def _enqueue(conn, accession: str, url: str, filed: date | None, form: str = "4") -> bool:
     cur = await conn.execute(
-        "INSERT INTO sec_filings(accession, form_type, url, filed_date) VALUES (%s, '4', %s, %s)"
+        "INSERT INTO sec_filings(accession, form_type, url, filed_date) VALUES (%s, %s, %s, %s)"
         " ON CONFLICT (accession) DO NOTHING",
-        (accession, url, filed),
+        (accession, form, url, filed),
     )
     return cur.rowcount == 1
 
 
 async def poll_form4_feed(client: SecClient, conn) -> int:
-    """Lit le flux récent Form 4 et met les nouveaux dépôts en file. Renvoie le nombre de nouveaux."""
+    return await poll_feed(client, conn, "4")
+
+
+async def poll_feed(client: SecClient, conn, form: str) -> int:
+    """Lit le flux récent d'un formulaire (4 ou 144) et met les nouveaux dépôts en file."""
     total = 0
     for page in range(MAX_PAGES):
-        resp = await client.get(CURRENT_URL.format(type="4", start=page * 100))
+        resp = await client.get(CURRENT_URL.format(type=form, start=page * 100))
         resp.raise_for_status()
         entries = parse_atom(resp.content)
         seen: set[str] = set()
         new = 0
         for e in entries:
-            if e.form != "4" or e.accession in seen:  # type=4 renvoie aussi d'autres formulaires
+            if e.form != form or e.accession in seen:  # type=4 renvoie aussi d'autres formulaires
                 continue
             seen.add(e.accession)
-            if await _enqueue(conn, e.accession, txt_url_from_index(e.link), e.filed):
+            if await _enqueue(conn, e.accession, txt_url_from_index(e.link), e.filed, form):
                 new += 1
         await conn.commit()
         total += new
@@ -252,12 +256,16 @@ async def backfill(client: SecClient, conn, n_days: int, done_days: set[str], to
 # ---------------------------------------------------------------- Form 4
 
 
-def extract_ownership_xml(txt: str) -> str | None:
+def extract_xml_block(txt: str, marker: str) -> str | None:
     for m in re.finditer(r"<XML>(.*?)</XML>", txt, re.DOTALL | re.IGNORECASE):
         block = m.group(1).strip()
-        if "<ownershipDocument" in block:
+        if marker in block:
             return block
     return None
+
+
+def extract_ownership_xml(txt: str) -> str | None:
+    return extract_xml_block(txt, "<ownershipDocument")
 
 
 _FILED_AS_OF = re.compile(r"FILED AS OF DATE:\s*(\d{8})")
@@ -415,11 +423,12 @@ async def store_form4(conn, accession: str, form: Form4, filed: date | None, url
     return n
 
 
-async def process_queue(client: SecClient, conn, limit: int = BATCH_SIZE, stop: asyncio.Event | None = None) -> dict:
+async def process_queue(client: SecClient, conn, limit: int = BATCH_SIZE, stop: asyncio.Event | None = None,
+                        form: str = "4") -> dict:
     cur = await conn.execute(
-        "SELECT accession, url, filed_date FROM sec_filings WHERE status = 'pending'"
+        "SELECT accession, url, filed_date, form_type FROM sec_filings WHERE status = 'pending' AND form_type = %s"
         " ORDER BY filed_date DESC NULLS LAST, created_at LIMIT %s",
-        (limit,),
+        (form, limit),
     )
     rows = await cur.fetchall()
     await conn.commit()
@@ -465,13 +474,19 @@ async def _store_batch(conn, items: list, stats: dict) -> None:
             if isinstance(got, Exception):
                 raise got
             txt = got
-            xml = extract_ownership_xml(txt)
-            if xml is None:
-                raise ValueError("bloc <ownershipDocument> introuvable")
-            form = parse_form4(xml)
             filed = row["filed_date"] or filed_date_from_txt(txt)
             link = row["url"].removesuffix(".txt") + "-index.htm"
-            stats["trades"] += await store_form4(conn, acc, form, filed, link)
+            if row.get("form_type") == "144":
+                xml = extract_xml_block(txt, "edgarSubmission")
+                if xml is None:
+                    raise ValueError("bloc <edgarSubmission> introuvable")
+                stats["trades"] += await store_form144(conn, acc, parse_form144(xml), filed, link)
+            else:
+                xml = extract_ownership_xml(txt)
+                if xml is None:
+                    raise ValueError("bloc <ownershipDocument> introuvable")
+                form = parse_form4(xml)
+                stats["trades"] += await store_form4(conn, acc, form, filed, link)
             await conn.execute(
                 "UPDATE sec_filings SET status='done', attempts=attempts+1, filed_date=COALESCE(filed_date,%s),"
                 " last_error=NULL, updated_at=now() WHERE accession=%s",
@@ -492,6 +507,86 @@ async def _store_batch(conn, items: list, stats: dict) -> None:
             )
             await conn.commit()
             _log.warning("dépôt %s en erreur : %s", acc, msg)
+
+
+# ---------------------------------------------------------------- Form 144
+
+
+def _strip_ns(root) -> None:
+    for el in root.iter():
+        if isinstance(el.tag, str) and "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+
+
+def _us_date(v: str | None) -> date | None:
+    if not v:
+        return None
+    try:
+        return datetime.strptime(v.strip(), "%m/%d/%Y").date()
+    except ValueError:
+        return _date(v)
+
+
+def parse_form144(xml_text: str) -> dict:
+    """Avis de vente envisagée (Form 144). Une ligne par catégorie de titres à vendre."""
+    root = ET.fromstring(xml_text.encode("utf-8") if isinstance(xml_text, str) else xml_text)
+    _strip_ns(root)
+    fd = root.find("formData")
+    issuer = fd.find("issuerInfo") if fd is not None else None
+    rels = [(r.text or "").strip() for r in (issuer.iter("relationshipToIssuer") if issuer is not None else [])]
+    sales = []
+    for si in (fd.findall("securitiesInformation") if fd is not None else []):
+        sales.append({
+            "security_class": (si.findtext("securitiesClassTitle") or "").strip() or None,
+            "shares": _num(si.findtext("noOfUnitsSold")),
+            "market_value": _num(si.findtext("aggregateMarketValue")),
+            "shares_outstanding": _num(si.findtext("noOfUnitsOutstanding")),
+            "approx_sale_date": _us_date(si.findtext("approxSaleDate")),
+        })
+    plan_dates = [(d.text or "").strip() for tag in ("planAdoptionDate", "planAdoptionDates")
+                  for d in root.iter(tag) if (d.text or "").strip()]
+    remarks = " ".join((r.text or "") for r in root.iter("remarks"))
+    cik = (issuer.findtext("issuerCik") if issuer is not None else "") or ""
+    return {
+        "issuer_cik": int(cik) if cik.strip().isdigit() else None,
+        "issuer_name": (issuer.findtext("issuerName") or "").strip() if issuer is not None else None,
+        "person": ((issuer.findtext("nameOfPersonForWhoseAccountTheSecuritiesAreToBeSold") or "").strip()
+                   if issuer is not None else "") or "Inconnu",
+        "relationship": ", ".join(r for r in rels if r) or None,
+        "plan_10b5_1": bool(plan_dates) or bool(re.search(r"10b5-?1", remarks, re.I)),
+        "sales": sales,
+    }
+
+
+MAX_PRICE_PER_SHARE = 50_000  # au-delà : montant saisi par erreur (Berkshire A exceptée)
+
+
+def plausible_value(shares: float | None, value: float | None, ticker: str | None) -> bool:
+    if not shares or not value:
+        return True
+    return value / shares <= MAX_PRICE_PER_SHARE or (ticker or "").upper() in ("BRK.A", "BRK-A")
+
+
+async def store_form144(conn, accession: str, n: dict, filed: date | None, url: str) -> int:
+    if not n["sales"]:
+        return 0
+    # Plusieurs catégories de titres : on cumule (cas rare), date de vente la plus proche.
+    shares = sum(s["shares"] or 0 for s in n["sales"]) or None
+    value = sum(s["market_value"] or 0 for s in n["sales"]) or None
+    first = n["sales"][0]
+    ticker = await _ticker_for_cik(conn, n["issuer_cik"])
+    if not plausible_value(shares, value, ticker):
+        value = None  # erreur de saisie dans le dépôt (ex. 4,1 Md$ pour 12 000 actions)
+    cur = await conn.execute(
+        """INSERT INTO sale_notices (accession, issuer_cik, issuer_name, ticker, person, relationship, security_class,
+             shares, market_value, shares_outstanding, approx_sale_date, filed_date, plan_10b5_1, url)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (accession) DO NOTHING""",
+        (accession, n["issuer_cik"], n["issuer_name"], ticker, n["person"], n["relationship"], first["security_class"],
+         shares, value, first["shares_outstanding"],
+         min((s["approx_sale_date"] for s in n["sales"] if s["approx_sale_date"]), default=None),
+         filed, n["plan_10b5_1"], url),
+    )
+    return cur.rowcount
 
 
 # ---------------------------------------------------------------- CIK → ticker
@@ -527,6 +622,10 @@ async def refresh_tickers(client: SecClient, conn) -> int:
     await conn.execute(
         "UPDATE ownership_filings o SET ticker = ct.ticker FROM cik_tickers ct"
         " WHERE o.ticker IS NULL AND o.subject_cik = ct.cik"
+    )
+    await conn.execute(
+        "UPDATE sale_notices s SET ticker = ct.ticker FROM cik_tickers ct"
+        " WHERE s.ticker IS NULL AND s.issuer_cik = ct.cik"
     )
     await conn.commit()
     return len(mapping)

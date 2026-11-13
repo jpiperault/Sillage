@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+from .ingest.funds import parse_funds_setting  # noqa: E402
 
 
 class ConfigError(Exception):
@@ -37,12 +40,16 @@ class Settings:
     sec_user_agent: str
     quiver_api_key: str | None
     house_enabled: bool
+    amf_enabled: bool
+    finra_enabled: bool
+    form144_enabled: bool
     allow_signup: bool
     ingest_enabled: bool
     ingest_interval_min: int
     backfill_days: int
     paper_start_cash: float
     port: int
+    funds_13f: dict = field(default_factory=dict)
 
     @property
     def congress_enabled(self) -> bool:
@@ -91,10 +98,14 @@ def load_settings(env: dict | None = None) -> Settings:
         sec_user_agent=(env.get("SEC_USER_AGENT") or "").strip() or f"Sillage/1.0 {admin_email}",
         quiver_api_key=(env.get("QUIVER_API_KEY") or "").strip() or None,
         house_enabled=_bool(env.get("HOUSE_ENABLED"), True),
+        amf_enabled=_bool(env.get("AMF_ENABLED"), True),
+        finra_enabled=_bool(env.get("FINRA_ENABLED"), True),
+        form144_enabled=_bool(env.get("FORM144_ENABLED"), True),
         allow_signup=_bool(env.get("ALLOW_SIGNUP"), True),
         ingest_enabled=_bool(env.get("INGEST_ENABLED"), True),
         ingest_interval_min=_int(env, "INGEST_INTERVAL_MIN", 10, minimum=1),
         backfill_days=_int(env, "BACKFILL_DAYS", 3, minimum=0),
         paper_start_cash=cash,
         port=_int(env, "PORT", 8080, minimum=1),
+        funds_13f=parse_funds_setting(env.get("FUNDS_13F")),
     )

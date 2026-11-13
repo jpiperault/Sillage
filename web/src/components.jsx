@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api.js'
-import { SIDE_LABEL, date, money, pct, scoreClass, tone, usd } from './format.js'
+import { SIDE_LABEL, SOURCE_LABEL, date, moneyCur, pct, priceCur, scoreClass, tone } from './format.js'
 
 export function Logo({ size = 30 }) {
   return (
@@ -62,6 +62,24 @@ export function Notice({ msg }) {
   return <div className={`notice ${msg.type || ''}`} role={msg.type === 'error' ? 'alert' : 'status'}>{msg.text}</div>
 }
 
+const short = (t, n = 70) => (t && t.length > n ? t.slice(0, n - 1) + '…' : t)
+
+/** Nom + rôle ; « X (via HOLDING) » → la holding passe sur la ligne du rôle. */
+function Who({ s }) {
+  const m = /^(.*?) \(via (.+)\)$/.exec(s.person || '')
+  const name = m ? m[1] : s.person
+  const via = m ? `via ${short(m[2], 40)}` : null
+  const company = s.source === 'amf' ? null : s.company
+  return (
+    <>
+      <div>{name}</div>
+      <div className="muted small" title={[s.role, via, s.company].filter(Boolean).join(' · ')}>
+        {[short(s.role), via, company].filter(Boolean).join(' · ')}
+      </div>
+    </>
+  )
+}
+
 export function SignalTable({ items, selected, onSelect, showSource = true }) {
   if (!items?.length) return <div className="empty">Aucun signal pour ces filtres. La collecte tourne toutes les quelques minutes.</div>
   return (
@@ -89,20 +107,17 @@ export function SignalTable({ items, selected, onSelect, showSource = true }) {
               <td>
                 <button type="button" className="row-btn ticker" aria-label={`Ouvrir le ticket ${s.ticker || ''} ${s.person}`}
                   onClick={(e) => { e.stopPropagation(); onSelect?.(s.id) }}>
-                  {s.ticker || '—'}
+                  {s.ticker || (s.source === 'amf' ? <span className="wrap" style={{ display: 'block', maxWidth: 170 }}>{s.company}</span> : '—')}
                 </button>
               </td>
-              <td className="wrap">
-                <div>{s.person}</div>
-                <div className="muted small">{s.role}{s.company ? ` · ${s.company}` : ''}</div>
-              </td>
+              <td className="wrap"><Who s={s} /></td>
               <td><SideBadge side={s.side} plan={s.plan_10b5_1} /></td>
-              <td className="r num">{s.amount_range || money(s.value)}</td>
-              <td className="r num">{s.price ? usd(s.price) : '—'}</td>
+              <td className="r num">{s.amount_range || moneyCur(s.value, s.currency)}</td>
+              <td className="r num">{s.price ? priceCur(s.price, s.currency) : '—'}</td>
               <td className={`r num ${tone(s.change_pct)}`}>{pct(s.change_pct)}</td>
               <td className="num">{date(s.trade_date)}</td>
               <td className="num">{date(s.filed_date)}{s.delay_days != null && <span className="muted small"> ({s.delay_days} j)</span>}</td>
-              {showSource && <td className="muted small">{s.source === 'insider' ? 'SEC Form 4' : 'Congrès'}</td>}
+              {showSource && <td className="muted small">{SOURCE_LABEL[s.source] || s.source}</td>}
             </tr>
           ))}
         </tbody>

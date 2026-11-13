@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from . import paper, scoring, security
-from .ingest import prices
+from .ingest import finra, funds as funds13f, prices
 
 router = APIRouter(prefix="/api/v1")
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
@@ -149,6 +149,7 @@ async def logout(response: Response):
 async def me(request: Request, user: dict = Depends(current_user)):
     st = _state(request).settings
     return {"user": _public_user(user), "congress_enabled": st.congress_enabled,
+            "amf_enabled": st.amf_enabled, "funds_13f_enabled": bool(st.funds_13f),
             "congress_sources": st.congress_sources,
             "paper_start_cash": st.paper_start_cash}
 
@@ -315,14 +316,61 @@ async def _build_signals(conn, *, source: str, side: str, fast: bool, days: int,
         clusters = await _congress_clusters(conn, tickers)
         pmap = await _price_map(conn, tickers)
         out += [_congress_signal(r, clusters.get(r["ticker"], 0), pmap.get(r["ticker"])) for r in rows]
+    if source in ("all", "amf") and side in ("all", "buy", "sell") and not ticker:
+        where = ["published >= current_date - %s::int"]
+        args = [days]
+        if side != "all":
+            where.append("side = %s")
+            args.append(side)
+        if fast:
+            where.append("trade_date IS NOT NULL AND published - trade_date <= 2")
+        cur = await conn.execute(
+            f"SELECT {AMF_COLS} FROM amf_trades WHERE {' AND '.join(where)}"
+            " ORDER BY published DESC, value DESC NULLS LAST LIMIT 1000", args)
+        rows = await cur.fetchall()
+        clusters = await _amf_clusters(conn, sorted({r["isin"] for r in rows if r["isin"]}))
+        out += [_amf_signal(r, clusters.get(r["isin"], 0)) for r in rows]
     await conn.commit()
     return out
+
+
+AMF_COLS = ("id, numero, company, person, role, side, isin, price, currency, volume, value, trade_date, published,"
+            " venue, nature, url")
+
+
+async def _amf_clusters(conn, isins: list[str]) -> dict[str, int]:
+    if not isins:
+        return {}
+    cur = await conn.execute(
+        "SELECT isin, count(DISTINCT person) AS n FROM amf_trades WHERE side='buy' AND isin = ANY(%s)"
+        " AND coalesce(trade_date, published) >= current_date - 30 GROUP BY isin", (isins,))
+    return {r["isin"]: r["n"] for r in await cur.fetchall()}
+
+
+def _amf_signal(r: dict, cluster: int) -> dict:
+    delay = scoring.days_between(r["trade_date"], r["published"])
+    code = "P" if r["side"] == "buy" else "S"
+    score, reasons = scoring.insider_score(
+        code=code, officer_title=r["role"], is_officer=bool(r["role"]), is_director=False, is_ten_percent=False,
+        value=_f(r["value"]), delay_days=delay, cluster=cluster if code == "P" else 0, plan_10b5_1=False,
+        price_change=None,
+    )
+    reasons[0] = ("Acquisition" if code == "P" else "Cession") + reasons[0][reasons[0].index(" ("):]
+    reasons = [r.replace(" M$", " M€").replace(" K$", " K€").replace(" $ ", " € ") for r in reasons]
+    return {
+        "id": f"a{r['id']}", "source": "amf", "ticker": None, "company": r["company"], "person": r["person"],
+        "role": r["role"] or "Dirigeant", "side": r["side"], "code": code, "shares": _f(r["volume"]),
+        "price": _f(r["price"]), "value": _f(r["value"]), "currency": "EUR" if (r["currency"] or "").lower().startswith("eur") else r["currency"],
+        "amount_range": None, "trade_date": r["trade_date"], "filed_date": r["published"], "delay_days": delay,
+        "plan_10b5_1": False, "cluster": cluster, "score": score, "reasons": reasons, "current_price": None,
+        "change_pct": None, "url": r["url"], "isin": r["isin"], "venue": r["venue"],
+    }
 
 
 @router.get("/signals")
 async def signals(
     request: Request,
-    source: Literal["all", "insider", "congress"] = "all",
+    source: Literal["all", "insider", "congress", "amf"] = "all",
     side: Literal["all", "buy", "sell", "option"] = "all",
     fast: bool = False,
     days: int = Query(7, ge=1, le=365),
@@ -343,12 +391,20 @@ async def signals(
 
 @router.get("/signals/{signal_id}")
 async def signal_detail(signal_id: str, request: Request, user: dict = Depends(current_user)):
-    m = re.fullmatch(r"([ic])(\d{1,18})", signal_id)
+    m = re.fullmatch(r"([ica])(\d{1,18})", signal_id)
     if not m:
         raise HTTPException(404, "Signal introuvable.")
     st = _state(request)
     kind, sid = m.group(1), int(m.group(2))
     async with st.pool.connection() as conn:
+        if kind == "a":
+            cur = await conn.execute(f"SELECT {AMF_COLS} FROM amf_trades WHERE id=%s", (sid,))
+            row = await cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Signal introuvable.")
+            sig = _amf_signal(row, (await _amf_clusters(conn, [row["isin"]])).get(row["isin"], 0) if row["isin"] else 0)
+            await conn.commit()
+            return {**sig, "in_watchlist": False, "quote": None, "position": None, "short": None, "notices": []}
         if kind == "i":
             cur = await conn.execute(f"SELECT {INSIDER_COLS} FROM insider_trades WHERE id=%s", (sid,))
         else:
@@ -374,10 +430,130 @@ async def signal_detail(signal_id: str, request: Request, user: dict = Depends(c
             "SELECT quantity, avg_price FROM paper_positions WHERE user_id=%s AND ticker=%s", (user["id"], row["ticker"])
         )
         pos = await cur.fetchone()
+        sig["short"] = await finra.stats_for(conn, row["ticker"]) if row["ticker"] else None
+        sig["notices"] = []
+        if row["ticker"]:
+            cur = await conn.execute(
+                "SELECT accession, person, relationship, shares, market_value, shares_outstanding, approx_sale_date,"
+                " filed_date, plan_10b5_1, url FROM sale_notices WHERE ticker=%s AND filed_date >= current_date - 60"
+                " ORDER BY filed_date DESC LIMIT 5", (row["ticker"],))
+            sig["notices"] = await cur.fetchall()
         await conn.commit()
+    if sig["short"]:
+        s = sig["short"]
+        sig["reasons"].append(f"Info : ventes à découvert {s['ratio_pct']} % du volume le {s['day']:%d/%m}"
+                              f" (moyenne 20 j : {s['avg20_pct']} %)".replace(".", ","))
+    if sig["notices"]:
+        sig["reasons"].append(f"Info : {len(sig['notices'])} vente(s) annoncée(s) (Form 144) sur 60 j")
     sig["quote"] = quote
     sig["position"] = {"quantity": float(pos["quantity"]), "avg_price": float(pos["avg_price"])} if pos else None
     return sig
+
+
+@router.get("/notices")
+async def notices(request: Request, days: int = Query(14, ge=1, le=180), min_value: float = Query(0, ge=0),
+                  ticker: str | None = None, user: dict = Depends(current_user)):
+    where = ["filed_date >= current_date - %s::int", "coalesce(market_value, 0) >= %s"]
+    args: list = [days, min_value]
+    if ticker:
+        where.append("ticker = %s")
+        args.append(_ticker(ticker))
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT accession, issuer_name, ticker, person, relationship, shares, market_value, shares_outstanding,"
+            " approx_sale_date, filed_date, plan_10b5_1, url,"
+            " CASE WHEN shares_outstanding > 0 THEN shares / shares_outstanding * 100 END AS pct_outstanding"
+            f" FROM sale_notices WHERE {' AND '.join(where)}"
+            " ORDER BY filed_date DESC, market_value DESC NULLS LAST LIMIT 500", args)
+        items = await cur.fetchall()
+        await conn.commit()
+    return {"items": items}
+
+
+@router.get("/funds13f")
+async def funds_13f_list(request: Request, user: dict = Depends(current_user)):
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT DISTINCT ON (cik) cik, fund_name, period, filed_date, total_value, positions
+               FROM fund_filings ORDER BY cik, period DESC""")
+        items = await cur.fetchall()
+        await conn.commit()
+    tracked = _state(request).settings.funds_13f
+    known = {i["cik"] for i in items}
+    items += [{"cik": c, "fund_name": n, "period": None, "filed_date": None, "total_value": None, "positions": None}
+              for c, n in tracked.items() if c not in known]
+    items.sort(key=lambda i: (i["total_value"] or 0), reverse=True)
+    return {"items": items}
+
+
+async def _fund_moves(conn, cik: int) -> tuple[list[dict], list[dict]]:
+    cur = await conn.execute(
+        "SELECT accession, fund_name, period, filed_date, total_value FROM fund_filings WHERE cik=%s"
+        " ORDER BY period DESC LIMIT 2", (cik,))
+    filings = await cur.fetchall()
+    if not filings:
+        return [], []
+    cur_acc = filings[0]["accession"]
+    prev_acc = filings[1]["accession"] if len(filings) > 1 else None
+    cur = await conn.execute(
+        """WITH c AS (SELECT * FROM fund_holdings WHERE accession=%s),
+                p AS (SELECT * FROM fund_holdings WHERE accession=%s)
+           SELECT coalesce(c.cusip, p.cusip) AS cusip, coalesce(c.put_call, p.put_call) AS put_call,
+                  coalesce(c.issuer, p.issuer) AS issuer, c.shares AS shares, p.shares AS prev_shares,
+                  c.value AS value, p.value AS prev_value, t.ticker
+           FROM c FULL JOIN p ON c.cusip = p.cusip AND c.put_call = p.put_call
+           LEFT JOIN cusip_tickers t ON t.cusip = coalesce(c.cusip, p.cusip)""",
+        (cur_acc, prev_acc))
+    total = float(filings[0]["total_value"] or 0)
+    moves = []
+    for r in await cur.fetchall():
+        shares, prev = _f(r["shares"]), _f(r["prev_shares"])
+        status = funds13f.classify(shares, prev) if prev_acc else "held"
+        moves.append({
+            **r, "shares": shares, "prev_shares": prev, "value": _f(r["value"]), "prev_value": _f(r["prev_value"]),
+            "status": status, "weight_pct": round(_f(r["value"]) / total * 100, 2) if total and r["value"] else None,
+            "change_pct": round((shares / prev - 1) * 100, 1) if shares and prev else None,
+        })
+    order = {"new": 0, "added": 1, "reduced": 2, "sold": 3, "held": 4}
+    moves.sort(key=lambda m: (order[m["status"]], -(m["value"] or m["prev_value"] or 0)))
+    return filings, moves
+
+
+@router.get("/funds13f/consensus")
+async def funds_13f_consensus(request: Request, user: dict = Depends(current_user)):
+    """Titres achetés ou renforcés par le plus de fonds suivis lors de leur dernier trimestre."""
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute("SELECT DISTINCT cik FROM fund_filings")
+        ciks = [r["cik"] for r in await cur.fetchall()]
+        agg: dict[str, dict] = {}
+        for cik in ciks:
+            filings, moves = await _fund_moves(conn, cik)
+            if len(filings) < 2:
+                continue
+            for m in moves:
+                if m["put_call"] or m["status"] not in ("new", "added", "sold", "reduced"):
+                    continue
+                a = agg.setdefault(m["cusip"], {"cusip": m["cusip"], "ticker": m["ticker"], "issuer": m["issuer"],
+                                                "buyers": [], "sellers": [], "value_bought": 0.0})
+                if m["status"] in ("new", "added"):
+                    a["buyers"].append({"fund": filings[0]["fund_name"], "status": m["status"]})
+                    a["value_bought"] += (m["value"] or 0) - (m["prev_value"] or 0)
+                else:
+                    a["sellers"].append({"fund": filings[0]["fund_name"], "status": m["status"]})
+        await conn.commit()
+    items = [a for a in agg.values() if len(a["buyers"]) >= 2]
+    items.sort(key=lambda a: (len(a["buyers"]) - len(a["sellers"]), a["value_bought"]), reverse=True)
+    return {"items": items[:40]}
+
+
+@router.get("/funds13f/{cik}")
+async def funds_13f_detail(cik: int, request: Request, user: dict = Depends(current_user)):
+    async with _state(request).pool.connection() as conn:
+        filings, moves = await _fund_moves(conn, cik)
+        await conn.commit()
+    if not filings:
+        raise HTTPException(404, "Aucun 13F collecté pour ce fonds.")
+    return {"filings": filings, "moves": moves}
 
 
 @router.get("/funds")
@@ -471,6 +647,10 @@ async def status(request: Request, user: dict = Depends(current_user)):
                       (SELECT count(*) FROM ownership_filings) AS ownership_filings,
                       (SELECT count(*) FROM congress_trades) AS congress_trades,
                       (SELECT count(*) FROM house_filings WHERE status='pending') AS house_pending,
+                      (SELECT count(*) FROM sale_notices) AS sale_notices,
+                      (SELECT count(*) FROM amf_trades) AS amf_trades,
+                      (SELECT count(*) FROM fund_filings) AS fund_filings,
+                      (SELECT count(DISTINCT day) FROM short_volume) AS short_days,
                       (SELECT count(*) FROM cik_tickers) AS tickers,
                       (SELECT count(*) FROM prices) AS prices,
                       (SELECT max(filed_date) FROM insider_trades) AS last_filed"""

@@ -30,6 +30,10 @@ avec un mode Entraînement en argent fictif. Un seul conteneur, état entièreme
 | `SEC_USER_AGENT` | non | Défaut `Sillage/1.0 <ADMIN_EMAIL>`. La SEC exige un contact joignable. |
 | `HOUSE_ENABLED` | non | `true` par défaut : transactions des représentants lues dans les déclarations officielles du Greffe de la Chambre (gratuit). |
 | `QUIVER_API_KEY` | non | Ajoute Quiver Quantitative (payant), surtout utile pour le Sénat. Si `HOUSE_ENABLED` est actif, Quiver ne fournit que le Sénat (pas de doublon). |
+| `FORM144_ENABLED` | non | `true` par défaut : ventes annoncées par les initiés (SEC Form 144). |
+| `AMF_ENABLED` | non | `true` par défaut : déclarations des dirigeants français (AMF, base BDIF). |
+| `FUNDS_13F` | non | Fonds suivis via leurs 13F : vide = 18 grands fonds par défaut (Berkshire, Pershing Square, Baupost…), liste de CIK séparés par des virgules pour choisir, `off` pour désactiver. CUSIP → ticker via OpenFIGI (gratuit). |
+| `FINRA_ENABLED` | non | `true` par défaut : part quotidienne des ventes à découvert (FINRA), affichée dans le ticket. |
 | `ALLOW_SIGNUP` | non | `true` par défaut ; `false` ferme les inscriptions. |
 | `INGEST_ENABLED` | non | `true` par défaut. |
 | `INGEST_INTERVAL_MIN` | non | 10 par défaut. |
@@ -106,6 +110,16 @@ docker run --rm -v "$PWD/server":/src -w /src python:3.12-slim sh -c "pip instal
 - Élus : la Chambre vient du Greffe (PTR déposés en ligne, actions cotées seulement ; ~99 % des lignes lues sur 45 PTR
   testés, les lignes coupées entre deux pages du PDF sont perdues ; PTR papier scannés ignorés ; pas de parti politique).
   Le Sénat n'est couvert qu'avec `QUIVER_API_KEY`, source jamais testée avec une vraie clé.
+- Form 144 : affiché seulement, sans score. Montant ignoré quand il implique plus de 50 000 $ par action (erreur de
+  saisie dans le dépôt). Les dépôts papier (rares) ne sont pas lus.
+- AMF : seules les acquisitions et cessions d'actions à prix non nul sont gardées (attributions gratuites, actions de
+  performance, donations ignorées). Pas de cours en direct ni de copie fictive pour les actions françaises (portefeuille
+  en dollars) ; montants en euros, mêmes seuils de score que pour les initiés américains. API BDIF non documentée.
+- 13F : 2 derniers trimestres par fonds, rafraîchis toutes les 6 h ; retard légal jusqu'à 45 jours après la fin du
+  trimestre. Les tickers arrivent progressivement (600 CUSIP par cycle via OpenFIGI, ~2 min) ; quelques titres restent
+  sans ticker. Pas encore intégré à la convergence.
+- FINRA : volume des ventes à découvert du jour (pas la position vendeuse totale), 45 jours gardés, information
+  seulement, sans effet sur le score.
 - Premier démarrage : ~470 PTR de l'année en file, lus par 150 à chaque cycle (environ 1 min par cycle).
 - Cours non officiels : Yahoo, puis Nasdaq en secours (Yahoo renvoie 429 depuis certaines adresses IP de serveur).
 - Pas encore d'alertes Telegram, de 13F ni de données AMF.

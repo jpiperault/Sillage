@@ -44,3 +44,17 @@ export const SIDE_LABEL = { buy: 'Achat', sell: 'Vente', option: 'Options' }
 export function scoreClass(s) {
   return s >= 70 ? 'hi' : s >= 45 ? 'mid' : 'lo'
 }
+
+const nfe = new Intl.NumberFormat('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+/** Montant dans la devise du signal (dollars par défaut, euros pour l'AMF). */
+export function moneyCur(v, cur) {
+  if (cur !== 'EUR') return money(v)
+  if (v == null || isNaN(v)) return '—'
+  const a = Math.abs(v)
+  if (a >= 1e6) return nfe.format(v / 1e6) + ' M€'
+  if (a >= 1e3) return nf0.format(v / 1e3) + ' K€'
+  return nf0.format(v) + ' €'
+}
+export const priceCur = (v, cur) => (cur === 'EUR' ? (v == null || isNaN(v) ? '—' : nfe.format(v) + ' €') : usd(v))
+
+export const SOURCE_LABEL = { insider: 'SEC Form 4', congress: 'Congrès', amf: 'AMF' }

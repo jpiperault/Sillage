@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
 import { api } from './api.js'
 import { Logo, Notice } from './components.jsx'
-import { Account, Congress, Funds, Guide, Insiders, Live, Training } from './pages.jsx'
+import { Account, Congress, France, Funds, Guide, Insiders, Live, Training } from './pages.jsx'
 
 const TABS = [
   ['live', 'Flux live', Live],
   ['paper', 'Entraînement', Training],
   ['insiders', 'Insiders', Insiders],
+  ['france', 'France', France],
   ['congress', 'Élus', Congress],
   ['funds', 'Fonds', Funds],
   ['guide', 'Signaux', Guide],
@@ -69,7 +70,7 @@ export default function App() {
         <Page me={me} onLogout={logout} />
       </main>
       <footer>
-        Sillage affiche des déclarations publiques ({['SEC EDGAR', ...(me.congress_sources || [])].join(', ')}) avec retard.
+        Sillage affiche des déclarations publiques ({['SEC EDGAR', ...(me.congress_sources || []), ...(me.amf_enabled ? ['AMF'] : []), 'FINRA'].join(', ')}) avec retard.
         Ce n'est pas un conseil en investissement : vous décidez et passez vos ordres vous-même. Cours indicatifs, non officiels.
       </footer>
     </>

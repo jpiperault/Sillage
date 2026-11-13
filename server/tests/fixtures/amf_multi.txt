@@ -1,0 +1,99 @@
+2026DD1150361
+FR001400H3A0 - DD194792
+12 novembre 2026
+INFORMATION
+Déclaration individuelle relative aux opérations des personnes
+mentionnées à l’article L.621-18-2 du Code monétaire et financier sur les titres de la société
+LA PRESENTE NOTIFICATION N’A PAS FAIT L’OBJET D’UN CONTROLE DE L’AMF ET EST ETABLIE
+SOUS LA RESPONSABILITE EXCLUSIVE DU DECLARANT.
+NOM /FONCTION DE LA PERSONNE EXERCANT DES RESPONSABILITES DIRIGEANTES OU DE LA
+PERSONNE ETROITEMENT LIEE :
+Charlie Evrard, administrateur
+NOTIFICATION INITIALE / MODIFICATION:
+Notification initiale
+COORDONNEES DE L’EMETTEUR
+NOM : MON COURTIER ENERGIE GROUPE
+DETAIL DE LA TRANSACTION 1
+DATE DE LA TRANSACTION : 10 novembre 2026
+LIEU DE LA TRANSACTION : Euronext Growth Paris
+NATURE DE LA TRANSACTION : Cession
+DESCRIPTION DE L’INSTRUMENT FINANCIER : Action
+INFORMATION DETAILLEE PAR OPERATION
+PRIX UNITAIRE : 5.3235 Euro
+VOLUME : 1 172.0000
+INFORMATIONS AGREGEES
+PRIX : 5.3235 Euro
+VOLUME : 1 172.0000
+TRANSACTION LIEE A L’EXERCICE DE PROGRAMMES D’OPTIONS SUR ACTIONS OU SUR UNE ATTRIBUTION
+D’ACTIONS GRATUITES OU DE PERFORMANCES : NON
+DETAIL DE LA TRANSACTION 2
+DATE DE LA TRANSACTION : 12 novembre 2026
+LIEU DE LA TRANSACTION : Euronext Growth Paris
+NATURE DE LA TRANSACTION : Cession
+DESCRIPTION DE L’INSTRUMENT FINANCIER : Action
+INFORMATION DETAILLEE PAR OPERATION
+PRIX UNITAIRE : 5.1745 Euro
+VOLUME : 730.0000
+INFORMATIONS AGREGEES
+PRIX : 5.1745 Euro
+VOLUME : 730.0000
+TRANSACTION LIEE A L’EXERCICE DE PROGRAMMES D’OPTIONS SUR ACTIONS OU SUR UNE ATTRIBUTION
+D’ACTIONS GRATUITES OU DE PERFORMANCES : NON
+DATE DE RECEPTION DE LA NOTIFICATION : 12 novembre 2026
+COMMENTAIRES :
+"Les données à caractère personnel collectées par le biais de ce formulaire font l’objet d’un traitement informatique réservé à l’usage exclusif de
+l’AMF pour l’accomplissement de ses missions. En application du règlement (UE) n° 2016/679 du 27 avril 2016 et de la loi n° 78-17 du 6 janvier 1978,
+le droit d’accès et le cas échéant, de rectification, d’effacement, d’opposition ou de limitation du traitement des données personnelles des personnes
+physiques les concernant, peut être exercé par courrier à l’adresse suivante : AMF - Délégué à la protection des données - 17 place de la Bourse,
+75002 Paris ; et via le formulaire « données personnelles » accessible sur le site internet de l’AMF. Vous pouvez également introduire une
+réclamation au sujet du traitement de vos données auprès de la CNIL."
+2026DD1150361
+FR001400H3A0 - DD194792
+12 November 2026
+INFORMATION
+Individual notification relating to transactions by persons referred to in Article L.621-18-2 of the Monetary and
+Financial Code on the securities of the company
+THIS NOTIFICATION HAS NOT BEEN REVIEWED BY THE AUTORITÉ DES MARCHÉS
+FINANCIERS (AMF), AND IS MADE UNDER THE SOLE RESPONSIBILITY OF THE
+NOTIFYING PERSON.
+NAME / POSITION – STATUS OF THE PERSON DISCHARGING MANAGERIAL RESPONSABILITIES /
+PERSON CLOSELY ASSOCIATED:
+Charlie Evrard, administrateur
+INITIAL NOTIFICATION / AMENDMENT:
+Initial notification
+DETAILS OF THE ISSUER
+NAME : MON COURTIER ENERGIE GROUPE
+DETAIL OF THE TRANSACTION 1
+DATE OF THE TRANSACTION : 10 November 2026
+PLACE OF THE TRANSACTION : Euronext Growth Paris
+NATURE OF THE TRANSACTION : Disposal
+DESCRIPTION OF THE FINANCIAL INSTRUMENT, TYPE OF INSTRUMENT : Share
+DETAILED OPERATION INFORMATION
+PRICE : 5.3235 Euro
+VOLUME : 1 172.0000
+AGGREGATED INFORMATION
+PRICE : 5.3235 Euro
+AGGREGATED VOLUME : 1 172.0000
+TRANSACTION LINKED TO THE EXERCISE OF A SHARE OPTION PROGRAM OR AN ALLOCATION OF BONUS
+OR PERFORMANCE SHARES : NO
+DETAIL OF THE TRANSACTION 2
+DATE OF THE TRANSACTION : 12 November 2026
+PLACE OF THE TRANSACTION : Euronext Growth Paris
+NATURE OF THE TRANSACTION : Disposal
+DESCRIPTION OF THE FINANCIAL INSTRUMENT, TYPE OF INSTRUMENT : Share
+DETAILED OPERATION INFORMATION
+PRICE : 5.1745 Euro
+VOLUME : 730.0000
+AGGREGATED INFORMATION
+PRICE : 5.1745 Euro
+AGGREGATED VOLUME : 730.0000
+TRANSACTION LINKED TO THE EXERCISE OF A SHARE OPTION PROGRAM OR AN ALLOCATION OF BONUS
+OR PERFORMANCE SHARES : NO
+DATE OF RECEIPT OF THE NOTIFICATION : 12 November 2026
+COMMENTS :
+"Personal data collected through this form is processed automatically and used exclusively by the AMF for the fulfilment of its statutory missions.
+Pursuant to Regulation (EU) 2016/679 of 27th April 2016 (GDPR) and French Data Protection Act No. 78-17 of 6th January 1978, data subjects are
+entitled to exercise their rights of access, rectification, deletion, objection, and restriction of processing with regard to their personal data. These rights
+may be exercised by submitting a written request to: AMF – Data Protection Officer (DPO) – 17 place de la Bourse, 75002 Paris, or via the dedicated
+"Personal Data" form on the AMF’s official website. Should you consider that your rights have been breached, you may file a complaint with the
+French Data Protection Authority (CNIL) at any time."

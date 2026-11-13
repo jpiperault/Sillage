@@ -6,7 +6,8 @@ from datetime import date
 
 _TOP_TITLE = re.compile(
     r"\b(CEO|CFO|COO|President|Chair(man|woman|person)?|Founder|Co-?Founder|"
-    r"Chief\s+Executive|Chief\s+Financial|Chief\s+Operating)\b",
+    r"Chief\s+Executive|Chief\s+Financial|Chief\s+Operating|"
+    r"Pr[ée]sident|PDG|Directeur\s+g[ée]n[ée]ral|Directeur\s+financier|Fondateur|G[ée]rant)\b",
     re.IGNORECASE,
 )
 
