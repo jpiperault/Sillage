@@ -83,7 +83,7 @@ export function Alerts() {
   const [prefs, setPrefs] = useState(null)
   const [msg, setMsg] = useState(null)
   const [link, setLink] = useState(null)
-  useEffect(() => { if (data) setPrefs({ min_score: data.min_score, watchlist: data.watchlist, stops: data.stops }) }, [data])
+  useEffect(() => { if (data) setPrefs({ min_score: data.min_score, watchlist: data.watchlist, stops: data.stops, digest: data.digest }) }, [data])
 
   async function run(fn) {
     setMsg(null)
@@ -115,6 +115,7 @@ export function Alerts() {
             </div>
             <label className="check"><input type="checkbox" checked={prefs.watchlist} onChange={(e) => setPrefs({ ...prefs, watchlist: e.target.checked })} /> Tout ce qui touche ma watchlist</label>
             <label className="check"><input type="checkbox" checked={prefs.stops} onChange={(e) => setPrefs({ ...prefs, stops: e.target.checked })} /> Stops déclenchés (fictif)</label>
+            <label className="check"><input type="checkbox" checked={!!prefs.digest} onChange={(e) => setPrefs({ ...prefs, digest: e.target.checked })} /> Résumé quotidien le matin (aussi visible dans l'onglet Résumé)</label>
           </div>
           <div className="btn-row" style={{ marginTop: 12 }}>
             <button type="button" className="btn primary" onClick={() => run(async () => {
@@ -173,7 +174,11 @@ export function Settings() {
             return (
               <div key={it.key} className="field" style={{ margin: '10px 0' }}>
                 <label htmlFor={id}>{it.label} {it.source === 'interface' && <span className="badge buy">interface</span>}</label>
-                {it.type === 'bool' ? (
+                {it.type.startsWith('choice:') ? (
+                  <select id={id} value={val} onChange={(e) => setDraft({ ...draft, [it.key]: e.target.value })}>
+                    {it.type.slice(7).split(',').map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                ) : it.type === 'bool' ? (
                   <select id={id} value={val} onChange={(e) => setDraft({ ...draft, [it.key]: e.target.value })}>
                     <option value="oui">oui</option><option value="non">non</option>
                   </select>
@@ -193,6 +198,11 @@ export function Settings() {
       ))}
       <div className="btn-row">
         <button type="button" className="btn primary" disabled={!changed} onClick={() => save(draft)}>Enregistrer</button>
+        <button type="button" className="btn" onClick={async () => {
+          setMsg({ text: 'Test de l\'accès au Sénat en cours…' })
+          try { const r = await api('/admin/senate-test', { method: 'POST' }); setMsg({ type: r.ok ? 'ok' : 'error', text: r.message }) }
+          catch (e) { setMsg({ type: 'error', text: e.message }) }
+        }}>Tester l'accès au Sénat</button>
         {changed && <button type="button" className="btn" onClick={() => setDraft({})}>Annuler</button>}
       </div>
       <Notice msg={msg} />
@@ -259,7 +269,9 @@ export function StockPage({ ticker }) {
         <section className="panel" aria-label={`Fiche ${data.ticker}`}>
           <h2><span className="ticker">{data.ticker}</span> <span className="muted small">{data.name || ''}</span></h2>
           <div className="stats num">
-            <div className="stat"><div className="label">Cours</div><div className="value">{data.quote ? usd(data.quote.price) : '—'}</div></div>
+            <div className="stat"><div className="label">Cours</div><div className="value">{data.quote ? (data.quote.currency === 'EUR' ? `${data.quote.price.toFixed(2).replace('.', ',')} €` : usd(data.quote.price)) : '—'}</div></div>
+            {data.market_cap && <div className="stat"><div className="label">Capitalisation</div><div className="value">{money(data.market_cap)}</div></div>}
+            {data.next_earnings && <div className="stat"><div className="label">Prochains résultats</div><div className="value">{date(data.next_earnings.day)}</div>{data.next_earnings.timing && <div className="muted small">{data.next_earnings.timing}</div>}</div>}
             <div className="stat"><div className="label">Sur 1 an</div><div className={`value ${tone(last - first)}`}>{first ? pct((last / first - 1) * 100) : '—'}</div></div>
             <div className="stat"><div className="label">Signaux (1 an)</div><div className="value">{data.signals.length}</div></div>
             <div className="stat"><div className="label">Vente à découvert</div><div className="value">{lastShort ? `${String(lastShort.pct).replace('.', ',')} %` : '—'}</div>
@@ -288,6 +300,15 @@ export function StockPage({ ticker }) {
                   <td className="r num">{h.weight_pct != null ? pct(h.weight_pct, false) : '—'}</td></tr>
               ))}</tbody>
             </table></div>
+          </section>
+        )}
+        {(data.contracts?.amount_12m > 0 || data.buybacks?.length > 0) && (
+          <section className="panel" aria-label="Contrats publics et rachats">
+            <h2>Rachats d'actions et contrats publics</h2>
+            <ul className="reasons">
+              {data.buybacks.map((b) => <li key={b.accession}>{date(b.filed)} — annonce de rachat d'actions (8-K)</li>)}
+              {data.contracts?.amount_12m > 0 && <li>Contrats fédéraux américains sur 12 mois : <b>{money(Number(data.contracts.amount_12m))}</b> (USAspending, recherche « {data.contracts.search_name} »{data.contracts.recipients?.length ? ` : ${data.contracts.recipients.map((r) => r.name).slice(0, 3).join(', ')}` : ''})</li>}
+            </ul>
           </section>
         )}
         {(data.notices.length > 0 || data.ownership.length > 0) && (

@@ -15,13 +15,17 @@ export function money(v) {
   return nf0.format(v) + ' $'
 }
 
+const zero = (v) => (Math.abs(v) < 0.005 ? 0 : v)
+
 export function pct(v, sign = true) {
   if (v == null || isNaN(v)) return '—'
+  v = zero(v)
   return (sign && v > 0 ? '+' : '') + nf2.format(v) + ' %'
 }
 
 export function signed(v) {
   if (v == null || isNaN(v)) return '—'
+  v = zero(v)
   return (v > 0 ? '+' : '') + nf2.format(v) + ' $'
 }
 
@@ -37,7 +41,7 @@ export function datetime(v) {
   return isNaN(d) ? v : dtf.format(d)
 }
 
-export const tone = (v) => (v > 0 ? 'up' : v < 0 ? 'down' : '')
+export const tone = (v) => (v >= 0.005 ? 'up' : v <= -0.005 ? 'down' : '')
 
 export const SIDE_LABEL = { buy: 'Achat', sell: 'Vente', option: 'Options' }
 

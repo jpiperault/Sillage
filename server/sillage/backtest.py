@@ -22,6 +22,7 @@ from datetime import date, datetime, timedelta
 import httpx
 
 from . import log, scoring
+from .ingest.fundamentals import cap_bucket
 from .ingest.prices import BROWSER_UA
 
 _log = log.get("backtest")
@@ -31,6 +32,8 @@ HISTORY_URL = ("https://api.nasdaq.com/api/quote/{ticker}/historical?assetclass=
                "&fromdate={start}&todate={end}&limit=9999")
 HORIZONS = (21, 63, 126)
 BENCHMARK = "SPY"
+SMALL_BENCHMARK = "IWM"  # Russell 2000 : référence des petites et moyennes valeurs
+SMALL_CAP = 2e9          # sous 2 Md$ de capitalisation (ou inconnue) : comparaison au Russell 2000
 HISTORY_YEARS = 2
 HISTORY_REFRESH_DAYS = 7
 HISTORY_BATCH = 60  # ~2,5 s par titre chez Nasdaq : environ 2,5 min par cycle
@@ -246,13 +249,17 @@ async def refresh_histories(conn, client: HistoryClient, limit: int = HISTORY_BA
     cur = await conn.execute(
         """SELECT t.ticker FROM (
              SELECT %s AS ticker, 1000000 AS n
-             UNION ALL SELECT ticker, count(*) FROM bt_signals WHERE code='P' GROUP BY ticker) t
+             UNION ALL SELECT 'IWM', 1000000
+             UNION ALL SELECT ticker, count(*) FROM bt_signals WHERE code='P' GROUP BY ticker
+             UNION ALL SELECT ticker, count(*) FROM congress_trades WHERE ticker IS NOT NULL GROUP BY ticker) t
            LEFT JOIN price_history_state s USING (ticker)
            WHERE s.ticker IS NULL
               OR (s.fetched_at < now() - make_interval(days => %s)
                   -- rechargement utile seulement si un rendement à 6 mois reste à mesurer
-                  AND (t.ticker = %s OR EXISTS (SELECT 1 FROM bt_signals b WHERE b.ticker = t.ticker
-                                                AND b.filed_date > current_date - 200)))
+                  AND (t.ticker IN (%s, 'IWM') OR EXISTS (SELECT 1 FROM bt_signals b WHERE b.ticker = t.ticker
+                                                AND b.filed_date > current_date - 200)
+                       OR EXISTS (SELECT 1 FROM congress_trades c WHERE c.ticker = t.ticker
+                                  AND c.report_date > current_date - 200)))
            ORDER BY t.n DESC LIMIT %s""",
         (BENCHMARK, HISTORY_REFRESH_DAYS, BENCHMARK, limit))
     tickers = [r["ticker"] for r in await cur.fetchall()]
@@ -276,22 +283,31 @@ async def refresh_histories(conn, client: HistoryClient, limit: int = HISTORY_BA
 # ---------------------------------------------------------------- 3. calcul et rapport
 
 OUTCOMES_SQL = """
-SELECT s.*, e.close AS entry, e.day AS entry_day,
+SELECT s.*, e.close AS entry, e.day AS entry_day, cs.shares * e.close AS market_cap, bm.bench,
        x1.close AS c1, x2.close AS c2, x3.close AS c3,
        se.close AS spy_entry, s1.close AS spy1, s2.close AS spy2, s3.close AS spy3,
        (SELECT count(DISTINCT coalesce(b.owner_cik::text, b.owner_name)) FROM bt_signals b
-         WHERE b.code='P' AND b.ticker=s.ticker AND b.trade_date BETWEEN s.trade_date - 30 AND s.trade_date) AS cluster
+         WHERE b.code='P' AND b.ticker=s.ticker AND b.trade_date BETWEEN s.trade_date - 30 AND s.trade_date) AS cluster,
+       EXISTS (SELECT 1 FROM buybacks bb WHERE bb.cik = s.issuer_cik
+                 AND bb.filed BETWEEN s.filed_date - 90 AND s.filed_date) AS buyback,
+       EXISTS (SELECT 1 FROM earnings er WHERE er.ticker = s.ticker
+                 AND er.day BETWEEN s.filed_date AND s.filed_date + 30) AS earnings_soon,
+       EXISTS (SELECT 1 FROM earnings_days_done ed WHERE ed.day BETWEEN s.filed_date AND s.filed_date + 30)
+         AS earnings_known
 FROM bt_signals s
 JOIN LATERAL (SELECT idx, close, day FROM price_history p WHERE p.ticker=s.ticker AND p.day > s.filed_date
               ORDER BY p.day LIMIT 1) e ON true
-JOIN LATERAL (SELECT idx, close FROM price_history p WHERE p.ticker=%(bench)s AND p.day >= e.day
+LEFT JOIN company_shares cs ON cs.cik = s.issuer_cik
+CROSS JOIN LATERAL (SELECT CASE WHEN cs.shares * e.close >= %(small_cap)s THEN %(bench)s ELSE %(small)s END
+                    AS bench) bm
+JOIN LATERAL (SELECT idx, close FROM price_history p WHERE p.ticker=bm.bench AND p.day >= e.day
               ORDER BY p.day LIMIT 1) se ON true
 LEFT JOIN price_history x1 ON x1.ticker=s.ticker AND x1.idx=e.idx+%(h1)s
 LEFT JOIN price_history x2 ON x2.ticker=s.ticker AND x2.idx=e.idx+%(h2)s
 LEFT JOIN price_history x3 ON x3.ticker=s.ticker AND x3.idx=e.idx+%(h3)s
-LEFT JOIN price_history s1 ON s1.ticker=%(bench)s AND s1.idx=se.idx+%(h1)s
-LEFT JOIN price_history s2 ON s2.ticker=%(bench)s AND s2.idx=se.idx+%(h2)s
-LEFT JOIN price_history s3 ON s3.ticker=%(bench)s AND s3.idx=se.idx+%(h3)s
+LEFT JOIN price_history s1 ON s1.ticker=bm.bench AND s1.idx=se.idx+%(h1)s
+LEFT JOIN price_history s2 ON s2.ticker=bm.bench AND s2.idx=se.idx+%(h2)s
+LEFT JOIN price_history s3 ON s3.ticker=bm.bench AND s3.idx=se.idx+%(h3)s
 WHERE s.filed_date IS NOT NULL AND s.trade_date IS NOT NULL
 """
 
@@ -346,6 +362,11 @@ def dimensions(r: dict, score: int) -> dict[str, str]:
                                _bucket(pos, [(10, "< 10 % vendus"), (50, "10-50 % vendus"), (100, "50-99 % vendus")],
                                        "tout vendu")),
         "Prix d'entrée": "< 5 $" if entry < 5 else "≥ 5 $",
+        "Capitalisation": cap_bucket(float(r["market_cap"]) if r.get("market_cap") else None),
+        "Rachat d'actions annoncé (90 j)": "oui" if r.get("buyback") else "non",
+        "Résultats dans les 30 j": ("inconnu" if not r.get("earnings_known") else
+                                    "oui" if r.get("earnings_soon") else "non"),
+        "Track record de l'initié": r.get("track_label") or "aucun historique",
     }
 
 
@@ -358,18 +379,45 @@ def _stats(values: list[float]) -> dict | None:
             "win": round(sum(1 for v in values if v > 0) / len(values) * 100, 1)}
 
 
+def excess_returns(r: dict) -> dict[int, float]:
+    """Écart de performance avec la référence (SPY ou IWM selon la taille) à chaque horizon disponible."""
+    entry, ref0 = float(r["entry"]), float(r["spy_entry"])
+    out = {}
+    for h, c, s in zip(HORIZONS, ("c1", "c2", "c3"), ("spy1", "spy2", "spy3")):
+        if r[c] is not None and r[s] is not None:
+            out[h] = (float(r[c]) / entry - 1) - (float(r[s]) / ref0 - 1)
+    return out
+
+
+TRACK_MIN = 2  # au moins 2 achats passés mesurés pour parler de « track record »
+
+
+def annotate_track(rows: list[dict]) -> None:
+    """Ajoute à chaque achat le track record de l'initié AVANT ce signal (pas de fuite d'information future)."""
+    history: dict[str, list[tuple]] = {}
+    for r in sorted((r for r in rows if r["code"] == "P"), key=lambda r: r["filed_date"]):
+        key = str(r["owner_cik"] or r["owner_name"])
+        # seuls les achats dont le rendement à 3 mois était connu à la date du signal comptent
+        past = [x for (d_known, x) in history.get(key, []) if d_known <= r["filed_date"]]
+        if len(past) >= TRACK_MIN:
+            wins = sum(1 for x in past if x > 0) / len(past)
+            r["track_label"] = "favorable (≥ 60 % gagnants)" if wins >= 0.6 else (
+                "défavorable (≤ 40 % gagnants)" if wins <= 0.4 else "neutre")
+            r["track_wins"] = wins
+        ex = excess_returns(r).get(63)
+        if ex is not None:
+            history.setdefault(key, []).append((r["filed_date"] + timedelta(days=95), ex))
+
+
 def build_report(rows: list[dict]) -> dict:
-    """rows : résultats d'OUTCOMES_SQL. Performances en écart avec SPY (excès de rendement)."""
+    """rows : résultats d'OUTCOMES_SQL. Performances en écart avec la référence de marché adaptée à la taille."""
     groups: dict[tuple[str, str, str], dict[int, list[float]]] = {}
     filed = []
+    annotate_track(rows)
     for r in rows:
         score, _ = score_row(r)
-        entry, spy0 = float(r["entry"]), float(r["spy_entry"])
         filed.append(r["filed_date"])
-        excess = {}
-        for h, c, s in zip(HORIZONS, ("c1", "c2", "c3"), ("spy1", "spy2", "spy3")):
-            if r[c] is not None and r[s] is not None:
-                excess[h] = (float(r[c]) / entry - 1) - (float(r[s]) / spy0 - 1)
+        excess = excess_returns(r)
         if not excess:
             continue
         side = "Achats (P)" if r["code"] == "P" else "Ventes (S)"
@@ -384,25 +432,110 @@ def build_report(rows: list[dict]) -> dict:
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "horizons": list(HORIZONS),
-        "benchmark": BENCHMARK,
+        "benchmark": f"{BENCHMARK} (≥ 2 Md$) / {SMALL_BENCHMARK} (< 2 Md$ ou inconnue)",
         "signals": len(filed),
         "period": [min(filed).isoformat(), max(filed).isoformat()] if filed else None,
         "groups": out,
     }
 
 
-async def compute(conn) -> dict:
-    params = {"bench": BENCHMARK, "h1": HORIZONS[0], "h2": HORIZONS[1], "h3": HORIZONS[2]}
+async def outcome_rows(conn) -> list[dict]:
+    params = {"bench": BENCHMARK, "small": SMALL_BENCHMARK, "small_cap": SMALL_CAP,
+              "h1": HORIZONS[0], "h2": HORIZONS[1], "h3": HORIZONS[2]}
     rows = []
-    async with conn.cursor(name="bt_outcomes") as cur:  # curseur serveur : pas tout en mémoire d'un coup
+    async with conn.cursor(name="bt_outcomes") as cur:
         await cur.execute(OUTCOMES_SQL, params)
         while batch := await cur.fetchmany(5000):
             rows.extend(batch)
-    report = await asyncio.to_thread(build_report, rows)
+    await conn.commit()
+    return rows
+
+
+async def compute(conn) -> dict:
+    """Rapport + track records des initiés + entraînement du score v2 (un seul passage sur les données)."""
+    from . import model as score_model  # import local : model importe backtest
+
+    rows = await outcome_rows(conn)
+    report = await asyncio.to_thread(build_report, rows)  # annote aussi le track record (annotate_track)
     await conn.execute("INSERT INTO bt_reports (report) VALUES (%s::jsonb)", (json_dumps(report),))
     await conn.execute("DELETE FROM bt_reports WHERE id NOT IN (SELECT id FROM bt_reports ORDER BY id DESC LIMIT 5)")
+    tracks = insider_tracks(rows)
+    await conn.execute("DELETE FROM track_records WHERE kind='insider'")
+    async with conn.cursor() as c:
+        await c.executemany(
+            "INSERT INTO track_records (kind, person_key, name, n, wins, mean_63, median_63, last_trade)"
+            " VALUES ('insider',%s,%s,%s,%s,%s,%s,%s)", tracks)
     await conn.commit()
-    return {"signals": report["signals"], "groups": len(report["groups"])}
+    fitted = await asyncio.to_thread(score_model.fit, rows)
+    if fitted:
+        await conn.execute("UPDATE score_models SET active=false WHERE side='P'")
+        await conn.execute(
+            "INSERT INTO score_models (side, model, metrics, active) VALUES ('P', %s::jsonb, %s::jsonb, %s)",
+            (json_dumps(fitted["model"]), json_dumps(fitted["metrics"]), fitted["metrics"]["validated"]))
+        await conn.execute("DELETE FROM score_models WHERE id NOT IN (SELECT id FROM score_models ORDER BY id DESC LIMIT 10)")
+        await conn.commit()
+    congress = await congress_tracks(conn)
+    return {"signals": report["signals"], "groups": len(report["groups"]), "insider_tracks": len(tracks),
+            "congress_tracks": congress,
+            "model": (fitted or {}).get("metrics", {}).get("auc"), "validated": (fitted or {}).get("metrics", {}).get("validated")}
+
+
+def insider_tracks(rows: list[dict]) -> list[tuple]:
+    per: dict[str, dict] = {}
+    for r in rows:
+        if r["code"] != "P":
+            continue
+        ex = excess_returns(r).get(63)
+        if ex is None:
+            continue
+        key = str(r["owner_cik"] or r["owner_name"])
+        p = per.setdefault(key, {"name": r["owner_name"], "x": [], "last": r["trade_date"]})
+        p["x"].append(ex)
+        p["last"] = max(p["last"], r["trade_date"])
+    out = []
+    for key, p in per.items():
+        xs = sorted(p["x"])
+        clipped = [min(max(v, CLIP[0]), CLIP[1]) for v in xs]
+        out.append((key, p["name"], len(xs), sum(1 for v in xs if v > 0), round(statistics.fmean(clipped) * 100, 2),
+                    round(statistics.median(xs) * 100, 2), p["last"]))
+    return out
+
+
+CONGRESS_SQL = """
+SELECT c.politician, c.trade_date, e.close AS entry, x.close AS c63, se.close AS b0, sx.close AS b63
+FROM congress_trades c
+JOIN LATERAL (SELECT idx, close, day FROM price_history p WHERE p.ticker=c.ticker AND p.day > coalesce(c.report_date, c.trade_date)
+              ORDER BY p.day LIMIT 1) e ON true
+JOIN LATERAL (SELECT idx, close FROM price_history p WHERE p.ticker=%(bench)s AND p.day >= e.day ORDER BY p.day LIMIT 1) se ON true
+JOIN price_history x ON x.ticker=c.ticker AND x.idx=e.idx+63
+JOIN price_history sx ON sx.ticker=%(bench)s AND sx.idx=se.idx+63
+WHERE c.side='buy' AND c.ticker IS NOT NULL
+"""
+
+
+async def congress_tracks(conn) -> int:
+    """Track record des élus : achats déclarés comparés au S&P 500 à 3 mois (achat à la déclaration)."""
+    cur = await conn.execute(CONGRESS_SQL, {"bench": BENCHMARK})
+    per: dict[str, dict] = {}
+    for r in await cur.fetchall():
+        ex = (float(r["c63"]) / float(r["entry"]) - 1) - (float(r["b63"]) / float(r["b0"]) - 1)
+        p = per.setdefault(r["politician"], {"x": [], "last": r["trade_date"]})
+        p["x"].append(ex)
+        if r["trade_date"] and (p["last"] is None or r["trade_date"] > p["last"]):
+            p["last"] = r["trade_date"]
+    await conn.execute("DELETE FROM track_records WHERE kind='congress'")
+    rows = []
+    for name, p in per.items():
+        xs = sorted(p["x"])
+        clipped = [min(max(v, CLIP[0]), CLIP[1]) for v in xs]
+        rows.append((name, name, len(xs), sum(1 for v in xs if v > 0), round(statistics.fmean(clipped) * 100, 2),
+                     round(statistics.median(xs) * 100, 2), p["last"]))
+    async with conn.cursor() as c:
+        await c.executemany(
+            "INSERT INTO track_records (kind, person_key, name, n, wins, mean_63, median_63, last_trade)"
+            " VALUES ('congress',%s,%s,%s,%s,%s,%s,%s)", rows)
+    await conn.commit()
+    return len(rows)
 
 
 def json_dumps(obj) -> str:

@@ -164,7 +164,9 @@ async def collect_for_user(conn, user: dict, since: datetime, signals_recent: li
 async def new_signal_ids(conn, since: datetime) -> set[str]:
     ids: set[str] = set()
     for prefix, sql in (
-        ("i", "SELECT min(id) AS id FROM insider_trades WHERE created_at > %s GROUP BY accession, code"),
+        ("i", "SELECT min(id) AS id FROM insider_trades WHERE created_at > %s AND amended_by IS NULL"
+              " GROUP BY accession, code"),
+        ("b", "SELECT id FROM bafin_trades WHERE created_at > %s"),
         ("c", "SELECT id FROM congress_trades WHERE created_at > %s"),
         ("a", "SELECT id FROM amf_trades WHERE created_at > %s"),
     ):
@@ -201,6 +203,40 @@ async def send_alerts(conn, tg: Telegram, build_signals, public_url: str) -> dic
         await conn.execute("UPDATE user_alerts SET last_check=%s WHERE user_id=%s", (now, u["user_id"]))
         await conn.commit()
     return {"users": len(users), "sent": sent}
+
+
+DIGEST_HOUR_UTC = 7  # vers 8-9 h à Paris
+
+
+async def send_digests(conn, tg: Telegram, build_signals, public_url: str) -> dict:
+    """Résumé quotidien (option par compte) : les meilleurs signaux des dernières 24 h, une fois par jour."""
+    now = datetime.now(timezone.utc)
+    if now.hour < DIGEST_HOUR_UTC:
+        return {"digests": 0}
+    cur = await conn.execute("SELECT * FROM user_alerts WHERE chat_id IS NOT NULL AND digest"
+                             " AND (digest_sent IS NULL OR digest_sent < current_date)")
+    users = await cur.fetchall()
+    await conn.commit()
+    if not users:
+        return {"digests": 0}
+    signals = await build_signals(conn)
+    since = now.date().toordinal() - 1
+    top = sorted([s for s in signals if s.get("filed_date") and s["filed_date"].toordinal() >= since],
+                 key=lambda s: s["score"], reverse=True)[:8]
+    sent = 0
+    for u in users:
+        lines = [f"☀️ <b>Résumé Sillage du {now:%d/%m}</b>"]
+        lines += [format_signal(s) for s in top] or ["Aucun nouveau signal depuis hier."]
+        if public_url:
+            lines.append(f'\n<a href="{html.escape(public_url)}/#resume">Voir le résumé complet</a>')
+        try:
+            await tg.send(u["chat_id"], "\n".join(lines))
+            sent += 1
+        except TelegramError as exc:
+            _log.warning("résumé non envoyé au compte %s : %s", u["user_id"], exc)
+        await conn.execute("UPDATE user_alerts SET digest_sent=current_date WHERE user_id=%s", (u["user_id"],))
+        await conn.commit()
+    return {"digests": sent}
 
 
 class Linker:

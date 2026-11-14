@@ -166,10 +166,12 @@ async def poll_feed(client: SecClient, conn, form: str) -> int:
         seen: set[str] = set()
         new = 0
         for e in entries:
-            if e.form != form or e.accession in seen:  # type=4 renvoie aussi d'autres formulaires
+            # type=4 renvoie aussi d'autres formulaires ; les corrections « 4/A » sont gardées.
+            accepted = (form, form + "/A") if form == "4" else (form,)
+            if e.form not in accepted or e.accession in seen:
                 continue
             seen.add(e.accession)
-            if await _enqueue(conn, e.accession, txt_url_from_index(e.link), e.filed, form):
+            if await _enqueue(conn, e.accession, txt_url_from_index(e.link), e.filed, e.form):
                 new += 1
         await conn.commit()
         total += new
@@ -243,10 +245,10 @@ async def backfill(client: SecClient, conn, n_days: int, done_days: set[str], to
             continue
         resp.raise_for_status()
         for row in parse_daily_index(resp.text):
-            if row.form != "4":
+            if row.form not in ("4", "4/A"):
                 continue
             url_txt = "https://www.sec.gov/Archives/" + row.path
-            if await _enqueue(conn, row.accession, url_txt, row.filed):
+            if await _enqueue(conn, row.accession, url_txt, row.filed, row.form):
                 added += 1
         await conn.commit()
         newly_done.append(key)
@@ -403,20 +405,36 @@ async def _ticker_for_cik(conn, cik: int | None) -> str | None:
     return row["ticker"] if row else None
 
 
-async def store_form4(conn, accession: str, form: Form4, filed: date | None, url: str) -> int:
+async def apply_amendment(conn, accession: str, form: Form4, filed: date | None) -> int:
+    """Une 4/A reprend la déclaration corrigée : les lignes d'origine (même société, même déclarant, mêmes dates)
+    sont marquées remplacées et sortent du flux ; elles restent en base pour la trace."""
+    dates = sorted({t["trade_date"] for t in form.trades if t["trade_date"]})
+    if not dates or form.issuer_cik is None or form.owner_cik is None:
+        return 0
+    cur = await conn.execute(
+        """UPDATE insider_trades SET amended_by=%s
+           WHERE issuer_cik=%s AND owner_cik=%s AND trade_date = ANY(%s) AND accession <> %s
+             AND amended_by IS NULL AND (%s::date IS NULL OR filed_date <= %s::date)""",
+        (accession, form.issuer_cik, form.owner_cik, dates, accession, filed, filed))
+    return cur.rowcount
+
+
+async def store_form4(conn, accession: str, form: Form4, filed: date | None, url: str,
+                      amendment: bool = False) -> int:
     ticker = form.ticker or await _ticker_for_cik(conn, form.issuer_cik)
     n = 0
     for t in form.trades:
         await conn.execute(
             """INSERT INTO insider_trades (accession, line_no, issuer_cik, issuer_name, ticker, owner_name, owner_cik,
                  is_director, is_officer, is_ten_percent, officer_title, code, acquired, shares, price, value,
-                 shares_after, trade_date, filed_date, plan_10b5_1, url)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 shares_after, trade_date, filed_date, plan_10b5_1, url, is_amendment)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (accession, line_no) DO NOTHING""",
             (
                 accession, t["line_no"], form.issuer_cik, form.issuer_name, ticker, form.owner_name, form.owner_cik,
                 form.is_director, form.is_officer, form.is_ten_percent, form.officer_title, t["code"], t["acquired"],
                 t["shares"], t["price"], t["value"], t["shares_after"], t["trade_date"], filed, form.plan_10b5_1, url,
+                amendment,
             ),
         )
         n += 1
@@ -426,9 +444,9 @@ async def store_form4(conn, accession: str, form: Form4, filed: date | None, url
 async def process_queue(client: SecClient, conn, limit: int = BATCH_SIZE, stop: asyncio.Event | None = None,
                         form: str = "4") -> dict:
     cur = await conn.execute(
-        "SELECT accession, url, filed_date, form_type FROM sec_filings WHERE status = 'pending' AND form_type = %s"
-        " ORDER BY filed_date DESC NULLS LAST, created_at LIMIT %s",
-        (form, limit),
+        "SELECT accession, url, filed_date, form_type FROM sec_filings WHERE status = 'pending'"
+        " AND form_type = ANY(%s) ORDER BY filed_date DESC NULLS LAST, created_at LIMIT %s",
+        ([form, form + "/A"] if form == "4" else [form], limit),
     )
     rows = await cur.fetchall()
     await conn.commit()
@@ -486,7 +504,10 @@ async def _store_batch(conn, items: list, stats: dict) -> None:
                 if xml is None:
                     raise ValueError("bloc <ownershipDocument> introuvable")
                 form = parse_form4(xml)
-                stats["trades"] += await store_form4(conn, acc, form, filed, link)
+                amendment = row.get("form_type") == "4/A"
+                if amendment:
+                    stats["amended"] = stats.get("amended", 0) + await apply_amendment(conn, acc, form, filed)
+                stats["trades"] += await store_form4(conn, acc, form, filed, link, amendment=amendment)
             await conn.execute(
                 "UPDATE sec_filings SET status='done', attempts=attempts+1, filed_date=COALESCE(filed_date,%s),"
                 " last_error=NULL, updated_at=now() WHERE accession=%s",

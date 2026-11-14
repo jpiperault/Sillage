@@ -10,8 +10,9 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
-from . import alerts, backtest, paper, scoring, security, settings_store
-from .ingest import finra, funds as funds13f, prices
+from . import alerts, backtest, model as score_model, paper, rules, scoring, security, settings_store
+from . import signals as signals_mod
+from .ingest import euronext, finra, funds as funds13f, prices, senate, usaspending
 
 router = APIRouter(prefix="/api/v1")
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
@@ -150,6 +151,7 @@ async def logout(response: Response):
 async def me(request: Request, user: dict = Depends(current_user)):
     st = _state(request).settings
     return {"user": _public_user(user), "congress_enabled": st.congress_enabled,
+            "bafin_enabled": st.bafin_enabled, "senate_enabled": st.senate_enabled,
             "amf_enabled": st.amf_enabled, "funds_13f_enabled": bool(st.funds_13f),
             "congress_sources": st.congress_sources,
             "paper_start_cash": st.paper_start_cash}
@@ -187,211 +189,20 @@ def _f(x):
     return float(x) if x is not None else None
 
 
-async def _insider_clusters(conn, tickers: list[str]) -> dict[str, int]:
-    if not tickers:
-        return {}
-    cur = await conn.execute(
-        "SELECT ticker, count(DISTINCT coalesce(owner_cik::text, owner_name)) AS n FROM insider_trades"
-        " WHERE code='P' AND ticker = ANY(%s) AND coalesce(trade_date, filed_date) >= current_date - 30"
-        " GROUP BY ticker",
-        (tickers,),
-    )
-    return {r["ticker"]: r["n"] for r in await cur.fetchall()}
-
-
-async def _congress_clusters(conn, tickers: list[str]) -> dict[str, int]:
-    if not tickers:
-        return {}
-    cur = await conn.execute(
-        "SELECT ticker, count(DISTINCT politician) AS n FROM congress_trades"
-        " WHERE ticker = ANY(%s) AND coalesce(report_date, trade_date) >= current_date - 30 GROUP BY ticker",
-        (tickers,),
-    )
-    return {r["ticker"]: r["n"] for r in await cur.fetchall()}
-
-
-async def _price_map(conn, tickers: list[str]) -> dict[str, float]:
-    if not tickers:
-        return {}
-    cur = await conn.execute("SELECT ticker, price FROM prices WHERE ticker = ANY(%s)", (tickers,))
-    return {r["ticker"]: float(r["price"]) for r in await cur.fetchall()}
-
-
-def _insider_role(r: dict) -> str:
-    parts = []
-    if r["officer_title"]:
-        parts.append(r["officer_title"])
-    elif r["is_officer"]:
-        parts.append("Dirigeant")
-    if r["is_director"]:
-        parts.append("Administrateur")
-    if r["is_ten_percent"]:
-        parts.append("Actionnaire > 10 %")
-    return ", ".join(parts) or "Initié"
-
-
-def _insider_signal(r: dict, cluster: int, current: float | None) -> dict:
-    delay = scoring.days_between(r["trade_date"], r["filed_date"])
-    price = _f(r["price"])
-    change = (current / price - 1) if current and price else None
-    score, reasons = scoring.insider_score(
-        code=r["code"], officer_title=r["officer_title"], is_officer=r["is_officer"], is_director=r["is_director"],
-        is_ten_percent=r["is_ten_percent"], value=_f(r["value"]), delay_days=delay,
-        cluster=cluster if r["code"] == "P" else 0, plan_10b5_1=r["plan_10b5_1"], price_change=change,
-    )
-    pos = backtest.position_change(r["code"], _f(r["shares"]), _f(r.get("shares_after")))
-    if r["code"] == "P":
-        reasons.append("Info : première ligne dans cette société" if pos is None and r.get("shares_after") is not None
-                       else f"Info : ligne augmentée de {pos:.0f} %" if pos is not None else "")
-    elif r["code"] == "S" and pos is not None:
-        reasons.append(f"Info : {pos:.0f} % de sa ligne vendue")
-    reasons = [x for x in reasons if x]
-    if (r.get("lines") or 1) > 1:
-        reasons.append(f"Info : {r['lines']} transactions regroupées (prix moyen)")
-    return {
-        "id": f"i{r['id']}", "source": "insider", "ticker": r["ticker"], "company": r["issuer_name"],
-        "person": r["owner_name"], "role": _insider_role(r), "side": ROLE_LABEL.get(r["code"], "other"),
-        "code": r["code"], "shares": _f(r["shares"]), "price": price, "value": _f(r["value"]),
-        "amount_range": None, "trade_date": r["trade_date"], "filed_date": r["filed_date"], "delay_days": delay,
-        "plan_10b5_1": r["plan_10b5_1"], "cluster": cluster, "score": score, "reasons": reasons,
-        "current_price": current, "change_pct": round(change * 100, 2) if change is not None else None,
-        "url": r["url"], "accession": r["accession"], "position_pct": round(pos, 1) if pos is not None else None,
-        "lines": r.get("lines") or 1,
-    }
-
-
-def _congress_signal(r: dict, cluster: int, current: float | None) -> dict:
-    delay = scoring.days_between(r["trade_date"], r["report_date"])
-    score, reasons = scoring.congress_score(side=r["side"], amount_min=_f(r["amount_min"]), delay_days=delay,
-                                            cluster=cluster)
-    chamber = {"House": "Représentant", "Senate": "Sénateur"}.get(r["chamber"] or "", r["chamber"])
-    role = " · ".join(x for x in (chamber, r["party"], r.get("state_dst")) if x) or "Élu"
-    return {
-        "id": f"c{r['id']}", "source": "congress", "ticker": r["ticker"], "company": None,
-        "person": r["politician"], "role": role, "side": r["side"], "code": None, "shares": None, "price": None,
-        "value": _f(r["amount_min"]), "amount_range": r["amount_range"], "trade_date": r["trade_date"],
-        "filed_date": r["report_date"], "delay_days": delay, "plan_10b5_1": False, "cluster": cluster,
-        "score": score, "reasons": reasons, "current_price": current, "change_pct": None, "url": r.get("url"),
-        "congress_source": r.get("source"),
-    }
-
-
-# Une ligne par déclaration et par code : une déclaration de 5 ventes S devient un seul signal
-# (total, prix moyen pondéré, actions détenues après la dernière ligne).
-INSIDER_GROUP_SQL = """
-SELECT min(id) AS id, accession, code, max(ticker) AS ticker, max(issuer_name) AS issuer_name,
-       max(owner_name) AS owner_name, bool_or(is_director) AS is_director, bool_or(is_officer) AS is_officer,
-       bool_or(is_ten_percent) AS is_ten_percent, max(officer_title) AS officer_title,
-       sum(shares) AS shares, sum(value) AS value,
-       sum(value) / nullif(sum(shares) FILTER (WHERE price IS NOT NULL), 0) AS price,
-       (array_agg(shares_after ORDER BY line_no DESC))[1] AS shares_after,
-       max(trade_date) AS trade_date, max(filed_date) AS filed_date, bool_or(plan_10b5_1) AS plan_10b5_1,
-       max(url) AS url, count(*) AS lines
-FROM insider_trades WHERE {where} GROUP BY accession, code"""
-CONGRESS_COLS = ("id, source, politician, party, chamber, ticker, side, amount_range, amount_min, trade_date,"
-                 " report_date, url, raw->>'state_dst' AS state_dst")
-
-
 async def _build_signals(conn, *, source: str, side: str, fast: bool, days: int, ticker: str | None,
-                         limit: int) -> list[dict]:
-    out: list[dict] = []
-    if source in ("all", "insider"):
-        where = ["filed_date >= current_date - %s::int"]
-        args: list = [days]
-        codes = {"all": ["P", "S", "M"], "buy": ["P"], "sell": ["S"], "option": ["M"]}[side]
-        where.append("code = ANY(%s)")
-        args.append(codes)
-        if ticker:
-            where.append("ticker = %s")
-            args.append(ticker)
-        if fast:
-            where.append("trade_date IS NOT NULL AND filed_date - trade_date <= 2")
-        cur = await conn.execute(
-            INSIDER_GROUP_SQL.format(where=" AND ".join(where))
-            + " ORDER BY max(filed_date) DESC, sum(value) DESC NULLS LAST LIMIT 2000",
-            args,
-        )
-        rows = await cur.fetchall()
-        tickers = sorted({r["ticker"] for r in rows if r["ticker"]})
-        clusters = await _insider_clusters(conn, tickers)
-        pmap = await _price_map(conn, tickers)
-        out += [_insider_signal(r, clusters.get(r["ticker"], 0), pmap.get(r["ticker"])) for r in rows]
-    if source in ("all", "congress") and side in ("all", "buy", "sell"):
-        where = ["coalesce(report_date, trade_date) >= current_date - %s::int"]
-        args = [days]
-        if side != "all":
-            where.append("side = %s")
-            args.append(side)
-        if ticker:
-            where.append("ticker = %s")
-            args.append(ticker)
-        if fast:
-            where.append("trade_date IS NOT NULL AND report_date - trade_date <= 15")
-        cur = await conn.execute(
-            f"SELECT {CONGRESS_COLS} FROM congress_trades WHERE {' AND '.join(where)}"
-            " ORDER BY report_date DESC NULLS LAST LIMIT 1000",
-            args,
-        )
-        rows = await cur.fetchall()
-        tickers = sorted({r["ticker"] for r in rows if r["ticker"]})
-        clusters = await _congress_clusters(conn, tickers)
-        pmap = await _price_map(conn, tickers)
-        out += [_congress_signal(r, clusters.get(r["ticker"], 0), pmap.get(r["ticker"])) for r in rows]
-    if source in ("all", "amf") and side in ("all", "buy", "sell") and not ticker:
-        where = ["published >= current_date - %s::int"]
-        args = [days]
-        if side != "all":
-            where.append("side = %s")
-            args.append(side)
-        if fast:
-            where.append("trade_date IS NOT NULL AND published - trade_date <= 2")
-        cur = await conn.execute(
-            f"SELECT {AMF_COLS} FROM amf_trades WHERE {' AND '.join(where)}"
-            " ORDER BY published DESC, value DESC NULLS LAST LIMIT 1000", args)
-        rows = await cur.fetchall()
-        clusters = await _amf_clusters(conn, sorted({r["isin"] for r in rows if r["isin"]}))
-        out += [_amf_signal(r, clusters.get(r["isin"], 0)) for r in rows]
-    await conn.commit()
-    return out
+                         limit: int, score_version: str = "auto") -> list[dict]:
+    return await signals_mod.build(conn, source=source, side=side, fast=fast, days=days, ticker=ticker,
+                                   limit=limit, score_version=score_version)
 
 
-AMF_COLS = ("id, numero, company, person, role, side, isin, price, currency, volume, value, trade_date, published,"
-            " venue, nature, url")
-
-
-async def _amf_clusters(conn, isins: list[str]) -> dict[str, int]:
-    if not isins:
-        return {}
-    cur = await conn.execute(
-        "SELECT isin, count(DISTINCT person) AS n FROM amf_trades WHERE side='buy' AND isin = ANY(%s)"
-        " AND coalesce(trade_date, published) >= current_date - 30 GROUP BY isin", (isins,))
-    return {r["isin"]: r["n"] for r in await cur.fetchall()}
-
-
-def _amf_signal(r: dict, cluster: int) -> dict:
-    delay = scoring.days_between(r["trade_date"], r["published"])
-    code = "P" if r["side"] == "buy" else "S"
-    score, reasons = scoring.insider_score(
-        code=code, officer_title=r["role"], is_officer=bool(r["role"]), is_director=False, is_ten_percent=False,
-        value=_f(r["value"]), delay_days=delay, cluster=cluster if code == "P" else 0, plan_10b5_1=False,
-        price_change=None,
-    )
-    reasons[0] = ("Acquisition" if code == "P" else "Cession") + reasons[0][reasons[0].index(" ("):]
-    reasons = [r.replace(" M$", " M€").replace(" K$", " K€").replace(" $ ", " € ") for r in reasons]
-    return {
-        "id": f"a{r['id']}", "source": "amf", "ticker": None, "company": r["company"], "person": r["person"],
-        "role": r["role"] or "Dirigeant", "side": r["side"], "code": code, "shares": _f(r["volume"]),
-        "price": _f(r["price"]), "value": _f(r["value"]), "currency": "EUR" if (r["currency"] or "").lower().startswith("eur") else r["currency"],
-        "amount_range": None, "trade_date": r["trade_date"], "filed_date": r["published"], "delay_days": delay,
-        "plan_10b5_1": False, "cluster": cluster, "score": score, "reasons": reasons, "current_price": None,
-        "change_pct": None, "url": r["url"], "isin": r["isin"], "venue": r["venue"],
-    }
+def _is_isin(t: str | None) -> bool:
+    return bool(t and len(t) == 12 and t[:2].isalpha() and t[-1].isdigit())
 
 
 @router.get("/signals")
 async def signals(
     request: Request,
-    source: Literal["all", "insider", "congress", "amf"] = "all",
+    source: Literal["all", "insider", "congress", "amf", "bafin", "europe"] = "all",
     side: Literal["all", "buy", "sell", "option"] = "all",
     fast: bool = False,
     days: int = Query(7, ge=1, le=365),
@@ -401,8 +212,10 @@ async def signals(
     user: dict = Depends(current_user),
 ):
     t = _ticker(ticker) if ticker else None
-    async with _state(request).pool.connection() as conn:
-        items = await _build_signals(conn, source=source, side=side, fast=fast, days=days, ticker=t, limit=limit)
+    st = _state(request)
+    async with st.pool.connection() as conn:
+        items = await _build_signals(conn, source=source, side=side, fast=fast, days=days, ticker=t, limit=2000,
+                                     score_version=st.settings.score_version)
     if sort == "score":
         items.sort(key=lambda s: (s["score"], s["filed_date"] or date.min), reverse=True)
     else:
@@ -410,56 +223,86 @@ async def signals(
     return {"items": items[:limit], "total": len(items)}
 
 
+async def _one_signal(conn, kind: str, sid: int, score_version: str) -> dict | None:
+    if kind == "i":
+        cur = await conn.execute(signals_mod.INSIDER_GROUP_SQL.format(
+            where="(accession, code) = (SELECT accession, code FROM insider_trades WHERE id=%s)"), (sid,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        cl = (await signals_mod._insider_clusters(conn, [row["ticker"]])).get(row["ticker"], 0) if row["ticker"] else 0
+        pm = await signals_mod._price_map(conn, [row["ticker"]] if row["ticker"] else [])
+        ctx = await signals_mod._context(conn, [row])
+        mrow = await signals_mod.active_model(conn)
+        return signals_mod.insider_signal(row, cl, pm.get(row["ticker"]), ctx,
+                                          mrow if signals_mod.use_v2(mrow, score_version) else None)
+    if kind == "c":
+        cur = await conn.execute(f"SELECT {signals_mod.CONGRESS_COLS} FROM congress_trades WHERE id=%s", (sid,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        cl = (await signals_mod._congress_clusters(conn, [row["ticker"]])).get(row["ticker"], 0) if row["ticker"] else 0
+        tr = await signals_mod.congress_tracks(conn, [row["politician"]])
+        return signals_mod.congress_signal(row, cl, None, tr.get(row["politician"]))
+    table, cols, source = (("amf_trades", signals_mod.AMF_COLS, "amf") if kind == "a"
+                           else ("bafin_trades", signals_mod.BAFIN_COLS, "bafin"))
+    cur = await conn.execute(f"SELECT {cols} FROM {table} WHERE id=%s", (sid,))
+    row = await cur.fetchone()
+    if not row:
+        return None
+    pm = await signals_mod._price_map(conn, [row["isin"]] if row["isin"] else [])
+    return signals_mod.europe_signal(row, 0, source, pm.get(row["isin"]))
+
+
 @router.get("/signals/{signal_id}")
 async def signal_detail(signal_id: str, request: Request, user: dict = Depends(current_user)):
-    m = re.fullmatch(r"([ica])(\d{1,18})", signal_id)
+    m = re.fullmatch(r"([icab])(\d{1,18})", signal_id)
     if not m:
         raise HTTPException(404, "Signal introuvable.")
     st = _state(request)
     kind, sid = m.group(1), int(m.group(2))
     async with st.pool.connection() as conn:
-        if kind == "a":
-            cur = await conn.execute(f"SELECT {AMF_COLS} FROM amf_trades WHERE id=%s", (sid,))
-            row = await cur.fetchone()
-            if not row:
-                raise HTTPException(404, "Signal introuvable.")
-            sig = _amf_signal(row, (await _amf_clusters(conn, [row["isin"]])).get(row["isin"], 0) if row["isin"] else 0)
-            await conn.commit()
-            return {**sig, "in_watchlist": False, "quote": None, "position": None, "short": None, "notices": []}
-        if kind == "i":
-            cur = await conn.execute(INSIDER_GROUP_SQL.format(
-                where="(accession, code) = (SELECT accession, code FROM insider_trades WHERE id=%s)"), (sid,))
-        else:
-            cur = await conn.execute(f"SELECT {CONGRESS_COLS} FROM congress_trades WHERE id=%s", (sid,))
-        row = await cur.fetchone()
+        sig = await _one_signal(conn, kind, sid, st.settings.score_version)
         await conn.commit()
-    if not row:
+    if not sig:
         raise HTTPException(404, "Signal introuvable.")
-    quote = await prices.get_price(st.pool, st.prices, row["ticker"]) if row["ticker"] else None
-    current = quote["price"] if quote else None
+    sym = sig.get("ticker") or sig.get("symbol")
+    quote = None
+    if sig.get("ticker"):
+        quote = await prices.get_price(st.pool, st.prices, sig["ticker"])
+        if quote and sig["source"] == "insider" and sig.get("price"):
+            sig["current_price"] = quote["price"]
+            sig["change_pct"] = round((quote["price"] / sig["price"] - 1) * 100, 2)
+    elif sym:
+        async with st.pool.connection() as conn:
+            cur = await conn.execute("SELECT price, currency, fetched_at FROM prices WHERE ticker=%s", (sym,))
+            q = await cur.fetchone()
+            usd = None
+            if q:
+                fx = await euronext.eur_usd(conn)
+                usd = float(q["price"]) * fx if fx and q["currency"] == "EUR" else None
+            await conn.commit()
+        if q:
+            quote = {"price": float(q["price"]), "currency": q["currency"], "fetched_at": q["fetched_at"],
+                     "stale": False, "price_usd": usd}
     async with st.pool.connection() as conn:
-        if kind == "i":
-            cl = (await _insider_clusters(conn, [row["ticker"]])).get(row["ticker"], 0) if row["ticker"] else 0
-            sig = _insider_signal(row, cl, current)
-        else:
-            cl = (await _congress_clusters(conn, [row["ticker"]])).get(row["ticker"], 0) if row["ticker"] else 0
-            sig = _congress_signal(row, cl, current)
-        cur = await conn.execute(
-            "SELECT 1 FROM watchlist WHERE user_id=%s AND ticker=%s", (user["id"], row["ticker"])
-        )
+        cur = await conn.execute("SELECT 1 FROM watchlist WHERE user_id=%s AND ticker=%s", (user["id"], sym))
         sig["in_watchlist"] = (await cur.fetchone()) is not None
-        cur = await conn.execute(
-            "SELECT quantity, avg_price FROM paper_positions WHERE user_id=%s AND ticker=%s", (user["id"], row["ticker"])
-        )
+        cur = await conn.execute("SELECT quantity, avg_price FROM paper_positions WHERE user_id=%s AND book='manual'"
+                                 " AND ticker=%s", (user["id"], sym))
         pos = await cur.fetchone()
-        sig["short"] = await finra.stats_for(conn, row["ticker"]) if row["ticker"] else None
+        sig["short"] = await finra.stats_for(conn, sig["ticker"]) if sig.get("ticker") else None
         sig["notices"] = []
-        if row["ticker"]:
+        sig["contracts"] = None
+        if sig.get("ticker"):
             cur = await conn.execute(
                 "SELECT accession, person, relationship, shares, market_value, shares_outstanding, approx_sale_date,"
                 " filed_date, plan_10b5_1, url FROM sale_notices WHERE ticker=%s AND filed_date >= current_date - 60"
-                " ORDER BY filed_date DESC LIMIT 5", (row["ticker"],))
+                " ORDER BY filed_date DESC LIMIT 5", (sig["ticker"],))
             sig["notices"] = await cur.fetchall()
+            if sig["source"] == "congress":
+                company = await _company_name(conn, sig["ticker"])
+                sig["contracts"] = await usaspending.cached(conn, sig["ticker"], company)
         await conn.commit()
     if sig["short"]:
         s = sig["short"]
@@ -467,9 +310,29 @@ async def signal_detail(signal_id: str, request: Request, user: dict = Depends(c
                               f" (moyenne 20 j : {s['avg20_pct']} %)".replace(".", ","))
     if sig["notices"]:
         sig["reasons"].append(f"Info : {len(sig['notices'])} vente(s) annoncée(s) (Form 144) sur 60 j")
+    c = sig.get("contracts")
+    if c and c.get("amount_12m"):
+        sig["reasons"].append(f"Info : contrats fédéraux sur 12 mois : {_fmt_big(float(c['amount_12m']))}"
+                              f" (USAspending, « {c['search_name']} »)")
     sig["quote"] = quote
     sig["position"] = {"quantity": float(pos["quantity"]), "avg_price": float(pos["avg_price"])} if pos else None
     return sig
+
+
+def _fmt_big(v: float) -> str:
+    if v >= 1e9:
+        return f"{v / 1e9:.1f} Md$".replace(".", ",")
+    if v >= 1e6:
+        return f"{v / 1e6:.1f} M$".replace(".", ",")
+    return f"{v / 1e3:.0f} K$"
+
+
+async def _company_name(conn, ticker: str) -> str | None:
+    cur = await conn.execute(
+        "SELECT coalesce((SELECT title FROM cik_tickers WHERE ticker=%s LIMIT 1),"
+        " (SELECT max(issuer_name) FROM insider_trades WHERE ticker=%s)) AS n", (ticker, ticker))
+    r = await cur.fetchone()
+    return r["n"] if r else None
 
 
 @router.get("/notices")
@@ -603,7 +466,7 @@ async def convergence(request: Request, user: dict = Depends(current_user)):
         cur = await conn.execute(
             """WITH i AS (SELECT ticker, count(DISTINCT coalesce(owner_cik::text, owner_name)) n,
                                  max(issuer_name) AS name
-                          FROM insider_trades WHERE code='P' AND ticker IS NOT NULL
+                          FROM insider_trades WHERE code='P' AND ticker IS NOT NULL AND amended_by IS NULL
                             AND filed_date >= current_date - 30 GROUP BY ticker),
                     c AS (SELECT ticker, count(DISTINCT politician) n FROM congress_trades
                           WHERE side='buy' AND ticker IS NOT NULL
@@ -673,6 +536,11 @@ async def status(request: Request, user: dict = Depends(current_user)):
                       (SELECT count(*) FROM amf_trades) AS amf_trades,
                       (SELECT count(*) FROM fund_filings) AS fund_filings,
                       (SELECT count(DISTINCT day) FROM short_volume) AS short_days,
+                      (SELECT count(*) FROM bafin_trades) AS bafin_trades,
+                      (SELECT count(*) FROM buybacks) AS buybacks,
+                      (SELECT count(*) FROM earnings WHERE day >= current_date) AS earnings_upcoming,
+                      (SELECT count(*) FROM company_shares) AS company_shares,
+                      (SELECT count(*) FROM track_records) AS track_records,
                       (SELECT count(*) FROM cik_tickers) AS tickers,
                       (SELECT count(*) FROM prices) AS prices,
                       (SELECT max(filed_date) FROM insider_trades) AS last_filed"""
@@ -694,51 +562,100 @@ async def status(request: Request, user: dict = Depends(current_user)):
 # ---------------------------------------------------------------- entraînement
 
 
+Book = Literal["manual", "rule"]
+
+
 class PaperOrder(BaseModel):
     ticker: str = Field(max_length=12)
     side: Literal["buy", "sell"]
     quantity: float | None = Field(default=None, gt=0, le=10_000_000)
     signal_ref: str | None = Field(default=None, max_length=32)
+    book: Book = "manual"
 
 
 @router.get("/paper")
-async def paper_get(request: Request, user: dict = Depends(current_user)):
+async def paper_get(request: Request, book: Book = "manual", user: dict = Depends(current_user)):
     st = _state(request)
     async with st.pool.connection() as conn:
-        return await paper.summary(conn, user["id"], st.settings.paper_start_cash)
+        res = await paper.summary(conn, user["id"], st.settings.paper_start_cash, book)
+        res["curve"] = await paper.equity_curve(conn, user["id"], book)
+        return res
 
 
 @router.post("/paper/orders")
 async def paper_order(body: PaperOrder, request: Request, user: dict = Depends(current_user)):
     st = _state(request)
     t = _ticker(body.ticker)
-    q = await prices.get_price(st.pool, st.prices, t)
-    if q is None:
-        raise HTTPException(400, f"Cours indisponible pour {t} : ordre fictif impossible.")
     async with st.pool.connection() as conn:
+        px, currency = await rules.quote_usd(st.pool, st.prices, conn, t)
+        if px is None:
+            raise HTTPException(400, f"Cours indisponible pour {t} : ordre fictif impossible.")
         try:
             if body.side == "buy":
                 if not body.quantity:
                     raise paper.PaperError("Indiquez une quantité.")
-                res = await paper.buy(conn, user["id"], t, body.quantity, q["price"], st.settings.paper_start_cash,
-                                      body.signal_ref)
+                res = await paper.buy(conn, user["id"], t, body.quantity, px, st.settings.paper_start_cash,
+                                      body.signal_ref, book=body.book, currency=currency)
             else:
-                res = await paper.sell_all(conn, user["id"], t, q["price"])
+                res = await paper.sell_all(conn, user["id"], t, px, book=body.book)
             await conn.commit()
         except paper.PaperError as exc:
             await conn.rollback()
             raise HTTPException(400, str(exc))
-    res["stale_price"] = q["stale"]
+    res["currency_note"] = "cours en euros converti en dollars au taux BCE" if currency == "EUR" else None
+    res["stale_price"] = False
     return res
 
 
 @router.post("/paper/reset")
-async def paper_reset(request: Request, user: dict = Depends(current_user)):
+async def paper_reset(request: Request, book: Book = "manual", user: dict = Depends(current_user)):
     st = _state(request)
     async with st.pool.connection() as conn:
-        await paper.reset(conn, user["id"], st.settings.paper_start_cash)
+        await paper.reset(conn, user["id"], st.settings.paper_start_cash, book)
         await conn.commit()
     return {"ok": True}
+
+
+class RuleConfig(BaseModel):
+    enabled: bool
+    min_score: int = Field(ge=0, le=100)
+    alloc_pct: float = Field(gt=0, le=20)
+    hold_days: int = Field(ge=5, le=400)
+    max_positions: int = Field(ge=1, le=100)
+    sources: list[Literal["insider", "congress", "amf", "bafin"]] = ["insider"]
+
+
+async def _rule_row(conn, user_id: int) -> dict:
+    await conn.execute("INSERT INTO paper_rules (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
+    cur = await conn.execute("SELECT * FROM paper_rules WHERE user_id=%s", (user_id,))
+    r = await cur.fetchone()
+    await conn.commit()
+    return {**r, "alloc_pct": float(r["alloc_pct"]), "sources": r["sources"].split(",")}
+
+
+@router.get("/paper/rule")
+async def paper_rule_get(request: Request, user: dict = Depends(current_user)):
+    async with _state(request).pool.connection() as conn:
+        return await _rule_row(conn, user["id"])
+
+
+@router.put("/paper/rule")
+async def paper_rule_put(body: RuleConfig, request: Request, user: dict = Depends(current_user)):
+    if not body.sources:
+        raise HTTPException(400, "Choisissez au moins une source.")
+    async with _state(request).pool.connection() as conn:
+        before = await _rule_row(conn, user["id"])
+        await conn.execute(
+            """UPDATE paper_rules SET enabled=%s, min_score=%s, alloc_pct=%s, hold_days=%s, max_positions=%s,
+                 sources=%s, last_check = CASE WHEN %s AND NOT enabled THEN now() ELSE last_check END
+               WHERE user_id=%s""",
+            (body.enabled, body.min_score, body.alloc_pct, body.hold_days, body.max_positions,
+             ",".join(body.sources), body.enabled, user["id"]))
+        await conn.commit()
+        if body.enabled and not before["enabled"]:
+            await paper.ensure_account(conn, user["id"], _state(request).settings.paper_start_cash, "rule")
+            await conn.commit()
+        return await _rule_row(conn, user["id"])
 
 
 # ---------------------------------------------------------------- watchlist
@@ -874,7 +791,8 @@ async def alerts_get(request: Request, user: dict = Depends(current_user)):
     bot = await _bot_username(st)
     return {"enabled": bool(st.settings.telegram_bot_token), "bot": bot, "linked": row["chat_id"] is not None,
             "link_url": f"https://t.me/{bot}?start={row['link_code']}" if bot and row["link_code"] else None,
-            "min_score": row["min_score"], "watchlist": row["watchlist"], "stops": row["stops"]}
+            "min_score": row["min_score"], "watchlist": row["watchlist"], "stops": row["stops"],
+            "digest": row["digest"]}
 
 
 @router.post("/alerts/link")
@@ -903,14 +821,15 @@ class AlertPrefs(BaseModel):
     min_score: int = Field(ge=0, le=100)
     watchlist: bool
     stops: bool
+    digest: bool = False
 
 
 @router.put("/alerts")
 async def alerts_put(body: AlertPrefs, request: Request, user: dict = Depends(current_user)):
     async with _state(request).pool.connection() as conn:
         await _alerts_row(conn, user["id"])
-        await conn.execute("UPDATE user_alerts SET min_score=%s, watchlist=%s, stops=%s WHERE user_id=%s",
-                           (body.min_score, body.watchlist, body.stops, user["id"]))
+        await conn.execute("UPDATE user_alerts SET min_score=%s, watchlist=%s, stops=%s, digest=%s WHERE user_id=%s",
+                           (body.min_score, body.watchlist, body.stops, body.digest, user["id"]))
         await conn.commit()
     return {"ok": True}
 
@@ -959,16 +878,40 @@ async def backtest_get(request: Request, user: dict = Depends(current_user)):
 async def ticker_page(ticker: str, request: Request, user: dict = Depends(current_user)):
     st = _state(request)
     t = _ticker(ticker)
-    quote = await prices.get_price(st.pool, st.prices, t)
+    isin = _is_isin(t)
+    quote = None if isin else await prices.get_price(st.pool, st.prices, t)
     async with st.pool.connection() as conn:
         try:
-            await backtest.ensure_history(conn, st.history, t)
+            if isin:
+                cur = await conn.execute("SELECT fetched_at > now() - interval '20 hours' AS fresh"
+                                         " FROM price_history_state WHERE ticker=%s", (t,))
+                fr = await cur.fetchone()
+                await conn.commit()
+                if not (fr and fr["fresh"]):
+                    cur = await conn.execute("SELECT max(venue) AS v FROM amf_trades WHERE isin=%s", (t,))
+                    venue = (await cur.fetchone())["v"]
+                    _, rows = await st.euronext.history(t, venue)
+                    await backtest.store_history(conn, t, rows)
+                    if rows:
+                        await conn.execute(
+                            "INSERT INTO prices (ticker, price, currency, fetched_at) VALUES (%s,%s,'EUR',now())"
+                            " ON CONFLICT (ticker) DO UPDATE SET price=EXCLUDED.price, currency='EUR', fetched_at=now()",
+                            (t, rows[-1][1]))
+                        await conn.commit()
+                cur = await conn.execute("SELECT price, currency, fetched_at FROM prices WHERE ticker=%s", (t,))
+                q = await cur.fetchone()
+                await conn.commit()
+                quote = {"price": float(q["price"]), "currency": q["currency"], "fetched_at": q["fetched_at"],
+                         "stale": False} if q else None
+            else:
+                await backtest.ensure_history(conn, st.history, t)
         except httpx.HTTPError:
             await conn.rollback()
         cur = await conn.execute("SELECT day, close FROM price_history WHERE ticker=%s AND day >= current_date - 365"
                                  " ORDER BY day", (t,))
         history = [{"d": r["day"], "c": float(r["close"])} for r in await cur.fetchall()]
-        sigs = await _build_signals(conn, source="all", side="all", fast=False, days=365, ticker=t, limit=500)
+        sigs = await _build_signals(conn, source="all", side="all", fast=False, days=365, ticker=t, limit=500,
+                                    score_version=st.settings.score_version)
         sigs.sort(key=lambda s: s["filed_date"] or date.min, reverse=True)
         cur = await conn.execute(
             "SELECT accession, person, relationship, shares, market_value, approx_sale_date, filed_date, plan_10b5_1, url"
@@ -995,11 +938,186 @@ async def ticker_page(ticker: str, request: Request, user: dict = Depends(curren
         cur = await conn.execute("SELECT day, short_volume / total_volume * 100 AS pct FROM short_volume"
                                  " WHERE ticker=%s ORDER BY day", (t,))
         short = [{"d": r["day"], "pct": round(float(r["pct"]), 1)} for r in await cur.fetchall()]
-        cur = await conn.execute("SELECT title FROM cik_tickers WHERE ticker=%s LIMIT 1", (t,))
+        cur = await conn.execute("SELECT cik, title FROM cik_tickers WHERE ticker=%s LIMIT 1", (t,))
         name = await cur.fetchone()
         cur = await conn.execute("SELECT 1 FROM watchlist WHERE user_id=%s AND ticker=%s", (user["id"], t))
         in_watch = (await cur.fetchone()) is not None
+        cur = await conn.execute("SELECT day, timing FROM earnings WHERE ticker=%s AND day >= current_date"
+                                 " ORDER BY day LIMIT 1", (t,))
+        next_earnings = await cur.fetchone()
+        market_cap, buybacks_rows, contracts = None, [], None
+        if name:
+            cur = await conn.execute("SELECT shares FROM company_shares WHERE cik=%s", (name["cik"],))
+            sh = await cur.fetchone()
+            if sh and quote:
+                market_cap = float(sh["shares"]) * quote["price"]
+            cur = await conn.execute("SELECT accession, filed FROM buybacks WHERE cik=%s ORDER BY filed DESC LIMIT 5",
+                                     (name["cik"],))
+            buybacks_rows = await cur.fetchall()
+            contracts = await usaspending.cached(conn, t, name["title"])
         await conn.commit()
-    return {"ticker": t, "name": name["title"] if name else (sigs[0]["company"] if sigs else None), "quote": quote,
+    company = name["title"] if name else (sigs[0]["company"] if sigs else None)
+    return {"ticker": t, "isin": isin, "name": company, "quote": quote,
             "history": history, "signals": sigs, "notices": notices, "ownership": ownership, "holders": holders,
-            "short": short, "in_watchlist": in_watch}
+            "short": short, "in_watchlist": in_watch, "next_earnings": next_earnings, "market_cap": market_cap,
+            "buybacks": buybacks_rows, "contracts": contracts}
+
+
+# ---------------------------------------------------------------- score v2, track records, Sénat
+
+
+@router.get("/model")
+async def model_info(request: Request, user: dict = Depends(current_user)):
+    st = _state(request)
+    async with st.pool.connection() as conn:
+        cur = await conn.execute("SELECT created_at, metrics, active, model->'weights' AS weights FROM score_models"
+                                 " WHERE side='P' ORDER BY id DESC LIMIT 1")
+        row = await cur.fetchone()
+        await conn.commit()
+    if not row:
+        return {"model": None, "version": st.settings.score_version}
+    weights = sorted(((k, v) for k, v in (row["weights"] or {}).items()), key=lambda kv: kv[1], reverse=True)
+    return {"model": {"created_at": row["created_at"], "metrics": row["metrics"], "active": row["active"],
+                      "weights": [{"feature": k, "label": score_model.LABELS.get(k) or score_model.describe_feature(k),
+                                   "weight": v} for k, v in weights]},
+            "version": st.settings.score_version,
+            "in_use": signals_mod.use_v2(row, st.settings.score_version)}
+
+
+@router.get("/tracks")
+async def tracks(request: Request, kind: Literal["insider", "congress"] = "insider",
+                 min_n: int = Query(3, ge=1, le=50), order: Literal["best", "worst", "most"] = "best",
+                 user: dict = Depends(current_user)):
+    sort = {"best": "wins::float / n DESC, median_63 DESC", "worst": "wins::float / n ASC, median_63 ASC",
+            "most": "n DESC"}[order]
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute(f"SELECT person_key, name, n, wins, mean_63, median_63, last_trade FROM track_records"
+                                 f" WHERE kind=%s AND n >= %s ORDER BY {sort} LIMIT 100", (kind, min_n))
+        items = await cur.fetchall()
+        await conn.commit()
+    return {"items": [{**r, "win_rate": round(r["wins"] / r["n"] * 100, 1)} for r in items]}
+
+
+@router.post("/admin/senate-test")
+async def senate_test(request: Request, user: dict = Depends(admin_user)):
+    return await senate.probe()
+
+
+# ---------------------------------------------------------------- résumé (tableau de bord)
+
+
+@router.get("/summary")
+async def summary(request: Request, user: dict = Depends(current_user)):
+    st = _state(request)
+    async with st.pool.connection() as conn:
+        sigs = await _build_signals(conn, source="all", side="all", fast=False, days=3, ticker=None, limit=3000,
+                                    score_version=st.settings.score_version)
+        cur = await conn.execute("SELECT ticker FROM watchlist WHERE user_id=%s", (user["id"],))
+        watch = {r["ticker"] for r in await cur.fetchall()}
+        cur = await conn.execute("SELECT DISTINCT ticker FROM paper_positions WHERE user_id=%s", (user["id"],))
+        held = {r["ticker"] for r in await cur.fetchall()}
+        cur = await conn.execute(
+            "SELECT accession, issuer_name, ticker, person, relationship, market_value, approx_sale_date, filed_date,"
+            " plan_10b5_1 FROM sale_notices WHERE filed_date >= current_date - 2 AND market_value IS NOT NULL"
+            " ORDER BY market_value DESC LIMIT 8")
+        notices = await cur.fetchall()
+        mine = sorted(watch | held)
+        cur = await conn.execute(
+            "SELECT ticker, day, timing FROM earnings WHERE ticker = ANY(%s) AND day BETWEEN current_date"
+            " AND current_date + 14 ORDER BY day", (mine,))
+        upcoming = await cur.fetchall()
+        cur = await conn.execute(
+            """SELECT f.fund_name, f.period, f.filed_date FROM fund_filings f
+               WHERE f.filed_date >= current_date - 7 ORDER BY f.filed_date DESC LIMIT 10""")
+        new_13f = await cur.fetchall()
+        books = {}
+        for book in paper.BOOKS:
+            cur = await conn.execute("SELECT 1 FROM paper_accounts WHERE user_id=%s AND book=%s", (user["id"], book))
+            if await cur.fetchone():
+                s = await paper.summary(conn, user["id"], st.settings.paper_start_cash, book)
+                books[book] = {k: s[k] for k in ("equity", "total_pct", "unrealized", "realized", "cash")}
+                books[book]["positions"] = len(s["positions"])
+        await conn.commit()
+    today = date.today()
+    recent = [s for s in sigs if s.get("filed_date") and (today - s["filed_date"]).days <= 1]
+    buys = sorted([s for s in recent if s["side"] == "buy"], key=lambda s: s["score"], reverse=True)
+    mine_sig = [s for s in sigs if (s.get("ticker") or s.get("symbol")) in watch | held]
+    return {
+        "date": today, "counts": {"signals_24h": len(recent), "buys_24h": len(buys)},
+        "top_buys": buys[:10], "watch_signals": mine_sig[:10], "notices": notices, "earnings": upcoming,
+        "new_13f": new_13f, "books": books,
+    }
+
+
+# ---------------------------------------------------------------- exports CSV
+
+
+def _csv(rows: list[dict], columns: list[tuple[str, str]], filename: str) -> Response:
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow([label for _, label in columns])
+    for r in rows:
+        w.writerow(["" if r.get(k) is None else (str(r.get(k)).replace(".", ",") if isinstance(r.get(k), float)
+                                                  else r.get(k)) for k, _ in columns])
+    return Response("\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@router.get("/export/signals.csv")
+async def export_signals(request: Request, source: Literal["all", "insider", "congress", "amf", "bafin", "europe"] = "all",
+                         side: Literal["all", "buy", "sell", "option"] = "all", days: int = Query(30, ge=1, le=365),
+                         user: dict = Depends(current_user)):
+    st = _state(request)
+    async with st.pool.connection() as conn:
+        items = await _build_signals(conn, source=source, side=side, fast=False, days=days, ticker=None, limit=5000,
+                                     score_version=st.settings.score_version)
+    items.sort(key=lambda s: (s["filed_date"] or date.min), reverse=True)
+    for s in items:
+        s["symbol_"] = s.get("ticker") or s.get("symbol")
+    cols = [("filed_date", "Déclaré le"), ("trade_date", "Trade"), ("source", "Source"), ("symbol_", "Ticker/ISIN"),
+            ("company", "Société"), ("person", "Qui"), ("role", "Rôle"), ("side", "Sens"), ("shares", "Actions"),
+            ("price", "Prix"), ("value", "Montant"), ("currency", "Devise"), ("amount_range", "Tranche"),
+            ("delay_days", "Délai (j)"), ("score", "Score"), ("score_version", "Version du score"),
+            ("probability", "Probabilité (%)"), ("url", "Lien")]
+    return _csv(items, cols, f"sillage-signaux-{date.today()}.csv")
+
+
+@router.get("/export/paper.csv")
+async def export_paper(request: Request, book: Book = "manual", user: dict = Depends(current_user)):
+    st = _state(request)
+    async with st.pool.connection() as conn:
+        s = await paper.summary(conn, user["id"], st.settings.paper_start_cash, book)
+    cols = [("created_at", "Date"), ("ticker", "Ticker"), ("side", "Sens"), ("quantity", "Quantité"),
+            ("price", "Prix ($)"), ("pnl", "Résultat ($)"), ("reason", "Motif"), ("signal_ref", "Signal"),
+            ("note", "Note")]
+    return _csv(s["orders"], cols, f"sillage-fictif-{book}-{date.today()}.csv")
+
+
+@router.get("/export/backtest.csv")
+async def export_backtest(request: Request, user: dict = Depends(current_user)):
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute("SELECT report FROM bt_reports ORDER BY id DESC LIMIT 1")
+        r = await cur.fetchone()
+        await conn.commit()
+    rows = []
+    for g in (r["report"]["groups"] if r else []):
+        for h, st_ in g["stats"].items():
+            if st_:
+                rows.append({"side": g["side"], "dimension": g["dimension"], "label": g["label"], "h": int(h),
+                             **st_})
+    cols = [("side", "Signaux"), ("dimension", "Critère"), ("label", "Tranche"), ("h", "Horizon (séances)"),
+            ("n", "Nombre"), ("mean", "Moyenne vs référence (%)"), ("median", "Médiane (%)"), ("win", "Gagnants (%)")]
+    return _csv(rows, cols, f"sillage-backtest-{date.today()}.csv")
+
+
+@router.get("/export/funds13f/{cik}.csv")
+async def export_13f(cik: int, request: Request, user: dict = Depends(current_user)):
+    async with _state(request).pool.connection() as conn:
+        filings, moves = await _fund_moves(conn, cik)
+        await conn.commit()
+    cols = [("status", "Mouvement"), ("ticker", "Ticker"), ("issuer", "Société"), ("cusip", "CUSIP"),
+            ("put_call", "Option"), ("shares", "Actions"), ("prev_shares", "Actions trimestre précédent"),
+            ("change_pct", "Variation (%)"), ("value", "Valeur ($)"), ("weight_pct", "Poids (%)")]
+    return _csv(moves, cols, f"sillage-13f-{cik}-{date.today()}.csv")

@@ -38,6 +38,9 @@ sans redémarrage.
 | `FORM144_ENABLED` | non | `true` par défaut : ventes annoncées par les initiés (SEC Form 144). |
 | `AMF_ENABLED` | non | `true` par défaut : déclarations des dirigeants français (AMF, base BDIF). |
 | `FUNDS_13F` | non | Fonds suivis via leurs 13F : vide = 18 grands fonds par défaut (Berkshire, Pershing Square, Baupost…), liste de CIK séparés par des virgules pour choisir, `off` pour désactiver. CUSIP → ticker via OpenFIGI (gratuit). |
+| `BAFIN_ENABLED` | non | `true` par défaut : Allemagne, déclarations des dirigeants (BaFin, export CSV public). |
+| `SENATE_ENABLED` | non | `false` par défaut : Sénat (eFD). **Non testé** (site bloqué depuis le serveur de dev) : utiliser « Tester l'accès au Sénat » dans Réglages avant de l'activer. |
+| `SCORE_VERSION` | non | `auto` (défaut) : score v2 calibré s'il est validé, sinon v1 ; `v1` ou `v2` pour forcer. |
 | `FINRA_ENABLED` | non | `true` par défaut : part quotidienne des ventes à découvert (FINRA), affichée dans le ticket. |
 | `BACKTEST_ENABLED` | non | `true` par défaut : backtest du score (historique SEC + cours Nasdaq), voir plus bas. |
 | `BACKTEST_QUARTERS` | non | Trimestres d'historique Form 4 analysés, 6 par défaut (1 à 12). |
@@ -68,7 +71,8 @@ passer pour l'admin). C'est un mot de passe que personne ne tape : on le génèr
 |---|---|
 | sec.gov (Form 4, Form 144, 13D/13G, 13F, tickers) | `User-Agent: <SEC_USER_AGENT>`, par défaut `Sillage/1.0 <ADMIN_EMAIL>` |
 | disclosures-clerk.house.gov (élus) | le même en-tête |
-| AMF, FINRA, Yahoo, Nasdaq | en-tête de navigateur générique, aucune donnée personnelle |
+| AMF, FINRA, Yahoo, Nasdaq, Euronext, BaFin, Sénat | en-tête de navigateur générique, aucune donnée personnelle |
+| BCE, USAspending | rien de personnel (taux de change ; nom de la société cherchée) |
 | api.telegram.org (si jeton réglé) | le texte des alertes et l'identifiant de conversation de chaque utilisateur lié |
 | OpenFIGI | en-tête par défaut de la bibliothèque HTTP + les CUSIP à convertir |
 | Quiver Quantitative (si clé) | la clé `QUIVER_API_KEY` |
@@ -77,6 +81,17 @@ La SEC exige un contact joignable dans le `User-Agent` de tout robot (politique 
 bloquer un robot qui n'en donne pas. L'adresse n'est pas publiée mais reste dans leurs journaux. Pour ne pas
 exposer l'adresse admin, définir `SEC_USER_AGENT` avec une adresse dédiée que l'on lit, par exemple
 `Sillage/1.0 sillage@piperault.fr`.
+
+## Collecte : deux boucles
+
+- **Rapide** (toutes les `INGEST_INTERVAL_MIN` minutes, ~15 s) : Form 4/4A, Form 144, 13D/13G, élus, AMF, cours,
+  stops, règle automatique, alertes, courbe des portefeuilles.
+- **Lente** (toutes les 5 min, chaque tâche à son rythme) : tickers et capitalisations (24 h), rachats d'actions
+  (2 h), calendrier des résultats (1 h), taux BCE (6 h), cours Euronext (25 min), BaFin (1 h), Sénat (1 h, si activé),
+  13F (6 h), CUSIP (10 min), FINRA (1 h), backtest (import 24 h, cours par lots, rapport et score v2 6-24 h).
+
+Premier démarrage d'une base vide : la boucle lente remonte progressivement 18 mois de rachats et de résultats et
+2 ans de cours (~3 000 titres à ~2,5 s) : compter une demi-journée avant le premier rapport complet.
 
 ## Comportement en production
 
@@ -149,6 +164,25 @@ performance avec le S&P 500 à 1, 3 et 6 mois, par tranche de score et par crit�
 plan 10b5-1, taille par rapport à la position, prix). Rapport recalculé une fois par jour. Il faut environ 20 cycles
 (3 à 4 h) après le premier démarrage pour que tous les cours soient chargés ; le rapport s'affiche dès le premier calcul.
 
+## Score v2
+
+Onglet **Signaux → Score v2**. Une régression logistique est entraînée sur les achats d'initiés du backtest
+(probabilité de battre sa référence de marché à 3 mois : S&P 500 au-dessus de 2 Md$ de capitalisation,
+Russell 2000 en dessous). Validation sur les 30 % de signaux les plus récents, jamais vus à l'entraînement : le
+modèle n'est utilisé que s'il fait mieux que le hasard (AUC ≥ 0,53 et meilleur quintile au-dessus de la moyenne).
+Le score affiché devient alors le rang centile de cette probabilité ; le ticket montre la probabilité, les critères
+qui pèsent le plus et le score v1 pour comparaison. Élus et Europe gardent le score v1.
+
+## Résumé, entraînement, exports
+
+- **Résumé** (premier onglet) : meilleurs achats des dernières 24 h, activité sur la watchlist et les positions,
+  grosses ventes annoncées, résultats à venir, nouveaux 13F, performance des portefeuilles. En option, le même
+  résumé chaque matin par Telegram.
+- **Entraînement** : deux portefeuilles fictifs, « Mon portefeuille » (ordres à la main) et « Règle automatique »
+  (copie des signaux au-dessus d'un score, part fixe par ligne, sortie à horizon ou au stop −8 %), chacun avec sa
+  courbe comparée au S&P 500. Actions européennes : cours Euronext converti au taux BCE.
+- **Exports CSV** (séparateur « ; », compatibles Excel) : signaux, journal fictif, rapport de backtest, 13F.
+
 ## Alertes Telegram
 
 1. Dans Telegram, écrire à **@BotFather**, commande `/newbot`, choisir un nom : il donne un jeton `123456:ABC…`.
@@ -194,6 +228,11 @@ répond `ok`.
 - Backtest : cours non officiels (Nasdaq) ; les titres radiés ou renommés n'ont pas de cours et sortent de l'échantillon
   (biais du survivant) ; les montants sont ceux déclarés, sans frais ni glissement.
 - Alertes Telegram : non testées avec un vrai bot avant livraison (logique testée hors ligne).
+- Sénat : écrit d'après le fonctionnement connu du site eFD, jamais exécuté (403 depuis le serveur de dev).
+- Allemagne : pas de cours (Xetra hors Euronext), donc ni variation depuis le trade ni copie fictive.
+- Contrats publics : recherche par nom de société (filiales au nom différent non comptées).
+- Score v2 : calibré sur 18 mois seulement (avril 2025 - septembre 2026), sans frais ni glissement ; titres radiés
+  absents (biais du survivant) ; à revalider à chaque nouveau rapport.
 - Premier démarrage : ~470 PTR de l'année en file, lus par 150 à chaque cycle (environ 1 min par cycle).
 - Cours non officiels : Yahoo, puis Nasdaq en secours (Yahoo renvoie 429 depuis certaines adresses IP de serveur).
 - Pas encore d'alertes Telegram, de 13F ni de données AMF.

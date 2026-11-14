@@ -66,6 +66,7 @@ def test_position_change_and_history():
 
 def _row(**kw):
     r = {"accession": "A", "code": "P", "ticker": "X", "relationship": "Officer", "officer_title": "CEO",
+         "owner_cik": 1, "owner_name": "Doe", "market_cap": None,
          "value": 300_000, "shares": 100, "shares_after": 200, "trade_date": date(2026, 1, 5),
          "filed_date": date(2026, 1, 6), "plan_10b5_1": False, "cluster": 1, "entry": 10.0,
          "spy_entry": 100.0, "c1": 11.0, "c2": 12.0, "c3": None, "spy1": 101.0, "spy2": 100.0, "spy3": None}

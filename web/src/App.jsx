@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react'
 import { api } from './api.js'
 import { Logo, Notice } from './components.jsx'
-import { Account, Congress, France, Funds, Guide, Insiders, Live, Training } from './pages.jsx'
+import { Account, Congress, France, Funds, Guide, Insiders, Live } from './pages.jsx'
 import { StockPage } from './extra.jsx'
+import { Summary, TrainingV2 } from './v2.jsx'
 
 const TABS = [
+  ['resume', 'Résumé', Summary],
   ['live', 'Flux live', Live],
-  ['paper', 'Entraînement', Training],
+  ['paper', 'Entraînement', TrainingV2],
   ['insiders', 'Insiders', Insiders],
-  ['france', 'France', France],
+  ['europe', 'Europe', France],
   ['congress', 'Élus', Congress],
   ['funds', 'Fonds', Funds],
   ['guide', 'Signaux', Guide],
@@ -19,7 +21,8 @@ function useHashTab() {
   const read = () => {
     const h = decodeURIComponent(window.location.hash.replace('#', ''))
     if (h.startsWith('action/') && h.length > 7) return h
-    return TABS.some(([k]) => k === h) ? h : 'live'
+    if (h === 'france') return 'europe'
+    return TABS.some(([k]) => k === h) ? h : 'resume'
   }
   const [tab, setTab] = useState(read)
   useEffect(() => {
@@ -59,7 +62,7 @@ export default function App() {
   return (
     <>
       <header className="topbar">
-        <a className="brand" href="#live" aria-label="Sillage, accueil">
+        <a className="brand" href="#resume" aria-label="Sillage, accueil">
           <Logo />
           <div><strong>Sillage</strong><br /><span>Suivez l'argent informé</span></div>
         </a>
@@ -77,7 +80,7 @@ export default function App() {
         {stock ? <StockPage key={stock} ticker={stock} /> : <Page me={me} onLogout={logout} />}
       </main>
       <footer>
-        Sillage affiche des déclarations publiques ({['SEC EDGAR', ...(me.congress_sources || []), ...(me.amf_enabled ? ['AMF'] : []), 'FINRA'].join(', ')}) avec retard.
+        Sillage affiche des déclarations publiques ({['SEC EDGAR', ...(me.congress_sources || []), ...(me.amf_enabled ? ['AMF'] : []), ...(me.bafin_enabled ? ['BaFin'] : []), 'FINRA', 'Euronext', 'Nasdaq', 'USAspending'].join(', ')}) avec retard.
         Ce n'est pas un conseil en investissement : vous décidez et passez vos ordres vous-même. Cours indicatifs, non officiels.
       </footer>
     </>

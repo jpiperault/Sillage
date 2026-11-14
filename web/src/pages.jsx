@@ -3,6 +3,7 @@ import { api } from './api.js'
 import { Notice, Score, Seg, SignalTable, useApi } from './components.jsx'
 import Ticket from './Ticket.jsx'
 import { Alerts, Backtest, Settings } from './extra.jsx'
+import { ExportLink, ModelPanel, TopPeople } from './v2.jsx'
 import { date, datetime, int, money, moneyCur, pct, signed, tone, usd } from './format.js'
 
 const DAYS = [['3', '3 j'], ['7', '7 j'], ['30', '30 j'], ['90', '90 j']]
@@ -30,7 +31,7 @@ export function Live({ me }) {
         <h2>Flux live</h2>
         <div className="filters">
           <Seg label="Source" value={source} onChange={setSource}
-            options={[['all', 'Tous'], ['insider', 'Initiés'], ['congress', 'Élus'], ...(me.amf_enabled ? [['amf', 'France']] : [])]} />
+            options={[['all', 'Tous'], ['insider', 'Initiés US'], ['congress', 'Élus'], ['europe', 'Europe']]} />
           <Seg label="Sens" value={side} onChange={setSide}
             options={[['all', 'Tous'], ['buy', 'Achats'], ['sell', 'Ventes'], ['option', 'Options']]} />
           <Seg label="Période" value={days} onChange={setDays} options={DAYS} />
@@ -45,7 +46,10 @@ export function Live({ me }) {
         <Notice msg={error && { type: 'error', text: error }} />
         {loading && !data ? <p className="muted">Chargement…</p> :
           <SignalTable items={data?.items} selected={selected} onSelect={setSelected} />}
-        {data && <p className="muted small">{data.items.length} affichés sur {data.total}.</p>}
+        {data && <div className="inline" style={{ justifyContent: 'space-between', width: '100%' }}>
+          <p className="muted small">{data.items.length} affichés sur {data.total}.</p>
+          <ExportLink href={`/signals.csv`.replace('/signals', '/export/signals') + `?source=${source}&side=${side}&days=${days}`} />
+        </div>}
       </section>
       <div className="side-col">
         <Ticket id={selected} />
@@ -180,15 +184,18 @@ export function Insiders() {
 }
 
 export function France() {
-  return <InsiderFeed source="amf" title="France" subtitle="déclarations des dirigeants des sociétés cotées françaises (AMF), achats et ventes d'actions" />
+  const [country, setCountry] = useState('europe')
+  return <InsiderFeed key={country} source={country} title="Europe"
+    subtitle="déclarations des dirigeants : France (AMF) et Allemagne (BaFin), achats et ventes d'actions"
+    extraFilter={<Seg label="Pays" value={country} onChange={setCountry} options={[['europe', 'Tous'], ['amf', 'France'], ['bafin', 'Allemagne']]} />} />
 }
 
-function InsiderFeed({ source, title, subtitle, withNotices = false }) {
+function InsiderFeed({ source, title, subtitle, withNotices = false, extraFilter = null }) {
   const [side, setSide] = useState('all')
   const [days, setDays] = useState('30')
   const [selected, setSelected] = useState(null)
   const { data, error } = useApi('/signals' + qs({ source, side, days, sort: 'date', limit: 300 }))
-  const sides = source === 'amf' ? [['all', 'Tous'], ['buy', 'Achats'], ['sell', 'Ventes']]
+  const sides = source !== 'insider' ? [['all', 'Tous'], ['buy', 'Achats'], ['sell', 'Ventes']]
     : [['all', 'Tous'], ['buy', 'Achats'], ['sell', 'Ventes'], ['option', 'Options']]
   return (
     <div className="grid-live">
@@ -196,6 +203,7 @@ function InsiderFeed({ source, title, subtitle, withNotices = false }) {
       <section className="panel" aria-label={title}>
         <h2>{title} <span className="muted small">{subtitle}</span></h2>
         <div className="filters">
+          {extraFilter}
           <Seg label="Sens" value={side} onChange={setSide} options={sides} />
           <Seg label="Période" value={days} onChange={setDays} options={DAYS} />
         </div>
@@ -203,6 +211,7 @@ function InsiderFeed({ source, title, subtitle, withNotices = false }) {
         <SignalTable items={data?.items} selected={selected} onSelect={setSelected} showSource={false} />
       </section>
       {withNotices && <Notices />}
+      {source === 'insider' && <TopPeople kind="insider" />}
       </div>
       <div className="side-col"><Ticket id={selected} /></div>
     </div>
@@ -290,6 +299,7 @@ export function Congress({ me }) {
             </div>
           )}
         </section>
+        <TopPeople kind="congress" />
         <section className="panel" aria-label="Flux des élus">
           <h2>Flux <span className="muted small">90 j</span></h2>
           <div className="filters">
@@ -337,6 +347,7 @@ function Funds13F() {
             {detail.data && <span className="muted small"> {detail.data.filings[0].fund_name} · trimestre au {date(detail.data.filings[0].period)}, déposé le {date(detail.data.filings[0].filed_date)}</span>}
           </h2>
           <p className="muted small">Les 13F arrivent jusqu'à 45 jours après la fin du trimestre : ce sont des mouvements anciens, à lire comme une conviction de long terme.</p>
+          {current && <ExportLink href={`/export/funds13f/${current}.csv`} />}
           <div className="filters">
             <Seg label="Afficher" value={filter} onChange={setFilter} options={[['moves', 'Mouvements'], ['all', 'Tout le portefeuille']]} />
           </div>
@@ -445,6 +456,7 @@ function Ownership() {
 export function Guide() {
   return (
     <>
+    <ModelPanel />
     <Backtest />
     <div className="grid-2 guide" style={{ marginTop: 16 }}>
       <section className="panel">
@@ -461,7 +473,11 @@ export function Guide() {
           <dt>Form 144</dt>
           <dd>Un initié qui veut vendre des actions « restreintes » doit l'annoncer à la SEC le jour où il passe l'ordre. C'est une vente à venir, souvent avant le Form 4. Seulement affiché, sans score.</dd>
           <dt>France (AMF)</dt>
-          <dd>Les dirigeants des sociétés françaises déclarent leurs opérations à l'AMF sous 3 jours ouvrés. Mêmes règles de score que les initiés américains, montants en euros. Pas de copie en fictif (portefeuille en dollars).</dd>
+          <dd>Les dirigeants des sociétés françaises (AMF) et allemandes (BaFin) déclarent leurs opérations sous 3 jours ouvrés. Mêmes règles de score que les initiés américains (v1), montants en euros. Copie en fictif possible : cours Euronext converti en dollars au taux BCE.</dd>
+          <dt>Corrections (4/A)</dt>
+          <dd>Quand un initié corrige sa déclaration, la version d'origine est retirée du flux et remplacée par la correction.</dd>
+          <dt>Capitalisation, rachats, résultats</dt>
+          <dd>Capitalisation (actions déclarées à la SEC × cours), annonces de rachat d'actions (8-K) et dates de résultats (Nasdaq) : affichés dans le ticket et utilisés par le score v2.</dd>
           <dt>13F</dt>
           <dd>Les gérants de plus de 100 M$ publient leurs positions américaines chaque trimestre, jusqu'à 45 jours après. Sillage suit une liste de grands fonds et montre leurs nouvelles lignes, renforcements, allègements et ventes.</dd>
           <dt>Ventes à découvert (FINRA)</dt>

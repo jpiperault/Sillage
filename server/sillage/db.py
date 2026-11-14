@@ -14,6 +14,7 @@ from . import log
 _log = log.get("db")
 MIGRATION_LOCK = 72_510_001
 INGEST_LOCK = 72_510_002
+SLOW_LOCK = 72_510_003
 
 
 def make_pool(url: str) -> AsyncConnectionPool:

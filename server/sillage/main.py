@@ -13,7 +13,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import alerts, backtest, db, log, paper, security, settings_store
+from . import alerts, backtest, db, log, paper, security, settings_store, signals
+from .ingest import euronext
 from .api import router
 from .config import ConfigError, Settings, load_settings
 from .ingest.prices import PriceClient
@@ -73,17 +74,16 @@ def create_app(settings: Settings) -> FastAPI:
         app.state.pool = pool
         app.state.prices = PriceClient()
         app.state.history = backtest.HistoryClient()
+        app.state.euronext = euronext.EuronextClient()
         app.state.base_settings = settings
         async with pool.connection() as conn:
             app.state.settings = settings_store.apply(settings, await settings_store.load(conn))
         await _bootstrap_admin(settings, pool)
         app.state.ingestor = None
         if settings.ingest_enabled:
-            from .api import _build_signals
-
             async def recent_signals(conn):
-                return await _build_signals(conn, source="all", side="all", fast=False, days=14, ticker=None,
-                                            limit=5000)
+                return await signals.build(conn, days=14, limit=5000,
+                                           score_version=app.state.settings.score_version)
 
             app.state.ingestor = Ingestor(lambda: app.state.settings, pool, app.state.prices, recent_signals)
             app.state.ingestor.start()
@@ -102,6 +102,7 @@ def create_app(settings: Settings) -> FastAPI:
             await app.state.linker.shutdown()
             await app.state.prices.close()
             await app.state.history.close()
+            await app.state.euronext.close()
             try:
                 await asyncio.wait_for(pool.close(timeout=1.0), 1.5)
             except asyncio.TimeoutError:

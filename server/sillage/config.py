@@ -50,6 +50,9 @@ class Settings:
     paper_start_cash: float
     port: int
     funds_13f: dict = field(default_factory=dict)
+    bafin_enabled: bool = True
+    senate_enabled: bool = False
+    score_version: str = "auto"
     telegram_bot_token: str | None = None
     public_url: str = ""
     backtest_enabled: bool = True
@@ -105,6 +108,9 @@ def load_settings(env: dict | None = None) -> Settings:
         amf_enabled=_bool(env.get("AMF_ENABLED"), True),
         finra_enabled=_bool(env.get("FINRA_ENABLED"), True),
         form144_enabled=_bool(env.get("FORM144_ENABLED"), True),
+        bafin_enabled=_bool(env.get("BAFIN_ENABLED"), True),
+        senate_enabled=_bool(env.get("SENATE_ENABLED"), False),
+        score_version=(env.get("SCORE_VERSION") or "auto").strip().lower(),
         allow_signup=_bool(env.get("ALLOW_SIGNUP"), True),
         ingest_enabled=_bool(env.get("INGEST_ENABLED"), True),
         ingest_interval_min=_int(env, "INGEST_INTERVAL_MIN", 10, minimum=1),

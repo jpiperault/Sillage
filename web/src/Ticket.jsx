@@ -13,7 +13,9 @@ export default function Ticket({ id, onChanged }) {
   const [msg, setMsg] = useState(null)
   const [busy, setBusy] = useState(false)
 
-  const price = s?.quote?.price ?? s?.current_price ?? null
+  const sym = s?.ticker || s?.symbol
+  const isEu = !!(s && !s.ticker && s.symbol)
+  const price = isEu ? (s?.quote?.price_usd ?? null) : (s?.quote?.price ?? s?.current_price ?? null)
   const equity = paper.data?.equity ?? 0
 
   useEffect(() => {
@@ -27,9 +29,9 @@ export default function Ticket({ id, onChanged }) {
   const stop = price ? price * (1 - STOP) : null
   const cost = price && Number(qty) > 0 ? price * Number(qty) : null
   const brokerText = useMemo(() => {
-    if (!s?.ticker || !price) return ''
+    if (!sym || !price) return ''
     const verb = s.side === 'sell' ? 'VENTE' : 'ACHAT'
-    return `${verb} ${qty || 0} ${s.ticker} au marché (≈ ${usd(price)}) — stop ${usd(stop)} (−8 %) — signal Sillage : ${s.person}, ${s.role}, déclaré le ${date(s.filed_date)}`
+    return `${verb} ${qty || 0} ${isEu ? `${s.company} (ISIN ${s.symbol})` : s.ticker} au marché (≈ ${usd(price)}) — stop ${usd(stop)} (−8 %) — signal Sillage : ${s.person}, ${s.role}, déclaré le ${date(s.filed_date)}`
   }, [s, price, qty, stop])
 
   if (!id) {
@@ -48,8 +50,8 @@ export default function Ticket({ id, onChanged }) {
     setMsg(null)
     try {
       const body = side === 'buy'
-        ? { ticker: s.ticker, side, quantity: Number(qty), signal_ref: s.id }
-        : { ticker: s.ticker, side }
+        ? { ticker: sym, side, quantity: Number(qty), signal_ref: s.id }
+        : { ticker: sym, side }
       const r = await api('/paper/orders', { method: 'POST', body })
       setMsg({
         type: 'ok',
@@ -78,9 +80,9 @@ export default function Ticket({ id, onChanged }) {
 
   async function toggleWatch() {
     try {
-      await api(`/watchlist/${encodeURIComponent(s.ticker)}`, { method: s.in_watchlist ? 'DELETE' : 'PUT' })
+      await api(`/watchlist/${encodeURIComponent(sym)}`, { method: s.in_watchlist ? 'DELETE' : 'PUT' })
       reload()
-      setMsg({ type: 'ok', text: s.in_watchlist ? `${s.ticker} retiré de la watchlist.` : `${s.ticker} ajouté à la watchlist.` })
+      setMsg({ type: 'ok', text: s.in_watchlist ? `${sym} retiré de la watchlist.` : `${sym} ajouté à la watchlist.` })
     } catch (e) {
       setMsg({ type: 'error', text: e.message })
     }
@@ -93,16 +95,19 @@ export default function Ticket({ id, onChanged }) {
         <SideBadge side={s.side} plan={s.plan_10b5_1} />
         <Score value={s.score} />
       </h2>
-      <div className="muted small">{s.company || ''}{s.ticker && <> · <a href={`#action/${s.ticker}`}>fiche de l'action</a></>}</div>
+      <div className="muted small">{s.company || ''}{sym && <> · <a href={`#action/${sym}`}>fiche de l'action</a></>}</div>
+      {s.probability != null && <p className="small">Probabilité de battre le marché à 3 mois : <b>{String(s.probability).replace('.', ',')} %</b> <span className="muted">(score v1 : {s.score_v1})</span></p>}
       <div>{s.person} <span className="muted">· {s.role}</span></div>
 
       <dl className="kv num">
         <dt>Prix au trade</dt><dd>{s.price ? priceCur(s.price, s.currency) : '—'}</dd>
-        {s.source !== 'amf' && <>
+        {!isEu && <>
           <dt>Cours actuel</dt>
           <dd>{price ? usd(price) : 'indisponible'}{s.quote?.stale && <span className="muted small"> (ancien)</span>}</dd>
           <dt>Depuis le trade</dt><dd className={tone(s.change_pct)}>{pct(s.change_pct)}</dd>
         </>}
+        {isEu && s.current_price != null && <><dt>Dernière clôture</dt><dd>{priceCur(s.current_price, 'EUR')} <span className={tone(s.change_pct)}>({pct(s.change_pct)})</span></dd></>}
+        {s.market_cap && <><dt>Capitalisation</dt><dd>{moneyCur(s.market_cap)}</dd></>}
         {s.isin && <><dt>ISIN</dt><dd>{s.isin}</dd></>}
         {s.venue && <><dt>Lieu</dt><dd className="small">{s.venue}</dd></>}
         <dt>Date du trade</dt><dd>{date(s.trade_date)}</dd>
@@ -129,7 +134,7 @@ export default function Ticket({ id, onChanged }) {
         </>
       )}
 
-      {s.ticker ? (
+      {sym && price ? (
         <>
           <div className="alloc">
             <div className="seg" role="group" aria-label="Allocation du portefeuille fictif">
@@ -157,13 +162,13 @@ export default function Ticket({ id, onChanged }) {
         </>
       ) : (
         <p className="muted">
-          {s.source === 'amf'
-            ? `Action française : le portefeuille fictif est en dollars et ne la couvre pas. Pour la copier, passez l'ordre chez votre broker${s.isin ? ` (ISIN ${s.isin})` : ''}.`
-            : 'Pas de ticker coté pour cet émetteur : copie impossible.'}
+          {isEu
+            ? `Cours Euronext indisponible pour l'instant (cotation hors Euronext ou pas encore chargée) : copie fictive impossible. Chez votre broker : ISIN ${s.symbol}.`
+            : sym ? 'Cours indisponible pour l\'instant : copie fictive impossible.' : 'Pas de ticker coté pour cet émetteur : copie impossible.'}
         </p>
       )}
       <Notice msg={msg} />
-      {s.url && <p className="small"><a href={s.url} target="_blank" rel="noopener noreferrer">{{ insider: 'Voir le dépôt sur le site de la SEC ↗', amf: "Voir la déclaration sur le site de l'AMF ↗" }[s.source] || 'Voir la déclaration (Greffe de la Chambre) ↗'}</a></p>}
+      {s.url && <p className="small"><a href={s.url} target="_blank" rel="noopener noreferrer">{{ insider: 'Voir le dépôt sur le site de la SEC ↗', amf: "Voir la déclaration sur le site de l'AMF ↗", congress: s.congress_source === 'senate' ? 'Voir la déclaration (Sénat) ↗' : 'Voir la déclaration (Greffe de la Chambre) ↗' }[s.source] || 'Voir la déclaration ↗'}</a></p>}
     </section>
   )
 }

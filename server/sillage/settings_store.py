@@ -26,12 +26,18 @@ EDITABLE: dict[str, tuple[str, str, bool, str, str]] = {
     "quiver_api_key": ("str", "Clé Quiver Quantitative", True, "Optionnelle, payante : ajoute le Sénat.", "Sources"),
     "amf_enabled": ("bool", "France : déclarations AMF", False, "", "Sources"),
     "finra_enabled": ("bool", "Ventes à découvert FINRA", False, "", "Sources"),
+    "bafin_enabled": ("bool", "Allemagne : déclarations BaFin", False, "", "Sources"),
+    "senate_enabled": ("bool", "Élus : Sénat (eFD)", False,
+                       "Non testé : le site du Sénat bloque certains serveurs. Utilisez « Tester l'accès au Sénat ».",
+                       "Sources"),
     "funds_13f": ("str", "Fonds suivis (13F)", False,
                   "Vide = 18 grands fonds par défaut ; sinon CIK séparés par des virgules ; « off » pour désactiver.",
                   "Sources"),
     "backtest_enabled": ("bool", "Backtest du score", False, "Historique SEC + cours Nasdaq, recalculé chaque jour.",
                          "Backtest"),
     "backtest_quarters": ("int", "Trimestres d'historique", False, "6 par défaut (~1 an et demi).", "Backtest"),
+    "score_version": ("choice:auto,v1,v2", "Score affiché", False,
+                      "auto = score v2 (calibré sur le backtest) s'il est validé, sinon v1 (points fixes).", "Backtest"),
     "telegram_bot_token": ("str", "Jeton du bot Telegram", True,
                            "Créé avec @BotFather dans Telegram. Active les alertes.", "Alertes"),
     "public_url": ("str", "Adresse publique du site", False, "Pour les liens des alertes, ex. https://sillage.piperault.fr",
@@ -50,6 +56,11 @@ def convert(key: str, raw: str | None):
     """Texte saisi → valeur typée du réglage ; lève SettingError si invalide."""
     kind = EDITABLE[key][0]
     v = (raw or "").strip()
+    if kind.startswith("choice:"):
+        choices = kind.split(":", 1)[1].split(",")
+        if v.lower() not in choices:
+            raise SettingError("valeur attendue : " + ", ".join(choices))
+        return v.lower()
     if kind == "bool":
         if v.lower() in ("1", "true", "oui", "on", "yes"):
             return True

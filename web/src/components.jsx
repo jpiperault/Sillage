@@ -69,7 +69,7 @@ function Who({ s }) {
   const m = /^(.*?) \(via (.+)\)$/.exec(s.person || '')
   const name = m ? m[1] : s.person
   const via = m ? `via ${short(m[2], 40)}` : null
-  const company = s.source === 'amf' ? null : s.company
+  const company = s.symbol && !s.ticker ? null : s.company
   return (
     <>
       <div>{name}</div>
@@ -107,7 +107,7 @@ export function SignalTable({ items, selected, onSelect, showSource = true }) {
               <td>
                 <button type="button" className="row-btn ticker" aria-label={`Ouvrir le ticket ${s.ticker || ''} ${s.person}`}
                   onClick={(e) => { e.stopPropagation(); onSelect?.(s.id) }}>
-                  {s.ticker || (s.source === 'amf' ? <span className="wrap" style={{ display: 'block', maxWidth: 170 }}>{s.company}</span> : '—')}
+                  {s.ticker || (s.symbol ? <span className="wrap" style={{ display: 'block', maxWidth: 170 }}>{s.company}</span> : '—')}
                 </button>
               </td>
               <td className="wrap"><Who s={s} /></td>
