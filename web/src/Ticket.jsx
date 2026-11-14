@@ -97,7 +97,7 @@ export default function Ticket({ id, onChanged }) {
       </h2>
       <div className="muted small">{s.company || ''}{sym && <> · <a href={`#action/${sym}`}>fiche de l'action</a></>}</div>
       {s.probability != null && <p className="small">Probabilité de battre le marché à 3 mois : <b>{String(s.probability).replace('.', ',')} %</b> <span className="muted">(score v1 : {s.score_v1})</span></p>}
-      <div>{s.person} <span className="muted">· {s.role}</span></div>
+      <div>{s.owner_cik ? <a href={`#initie/${s.owner_cik}`}>{s.person}</a> : s.person} <span className="muted">· {s.role}</span></div>
 
       <dl className="kv num">
         <dt>Prix au trade</dt><dd>{s.price ? priceCur(s.price, s.currency) : '—'}</dd>

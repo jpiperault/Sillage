@@ -10,9 +10,9 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
-from . import alerts, backtest, db, log, paper, rules
+from . import alerts, backtest, db, log, paper, price_alerts, rules
 from .config import Settings
-from .ingest import (amf, bafin, buybacks, congress, earnings, euronext, finra, fundamentals, funds, house,
+from .ingest import (amf, bafin, buybacks, company, congress, earnings, euronext, finra, fundamentals, funds, house,
                      prices, sec, senate)
 
 _log = log.get("jobs")
@@ -166,6 +166,7 @@ class Ingestor:
             info = dict(info or {})
             info["duration_s"] = round(time.monotonic() - t0, 1)
             await record(conn, name, ok=True, info=info)
+            await _run_log(conn, name, info["duration_s"], True, None)
             _log.info("étape %s : %s", name, info)
         except asyncio.CancelledError:
             raise
@@ -178,6 +179,7 @@ class Ingestor:
             _log.warning("étape %s en erreur : %s", name, msg)
             try:
                 await record(conn, name, ok=False, error=msg)
+                await _run_log(conn, name, round(time.monotonic() - t0, 1), False, msg)
             except Exception:  # noqa: BLE001
                 _log.exception("impossible d'enregistrer l'erreur de %s", name)
 
@@ -239,8 +241,9 @@ class Ingestor:
             return {"queued": await amf.poll_list(self.amf, conn)}
 
         async def amf_queue():
-            stats = await amf.process_queue(self.amf, conn, stop=self.stop)
-            stats["pending"] = await _count(conn, "SELECT count(*) AS n FROM amf_filings WHERE status='pending'")
+            stats = await amf.process_queue(self.amf, conn, stop=self.stop, recent=True)
+            stats["pending"] = await _count(conn, "SELECT count(*) AS n FROM amf_filings WHERE status='pending'"
+                                                  " AND published >= current_date - 7")
             return stats
 
         async def congress_step():
@@ -270,6 +273,14 @@ class Ingestor:
             finally:
                 await tg.close()
 
+        async def price_alerts_step():
+            tg = alerts.Telegram(s.telegram_bot_token) if s.telegram_bot_token else None
+            try:
+                return await price_alerts.check(conn, tg, s.public_url)
+            finally:
+                if tg:
+                    await tg.close()
+
         async def equity():
             return {"snapshots": await paper.snapshot_equity(conn)}
 
@@ -291,6 +302,7 @@ class Ingestor:
             await self._step(conn, "amf_queue", amf_queue)
         await self._step(conn, "prices", prices_step)
         await self._step(conn, "stops", stops)
+        await self._step(conn, "price_alerts", price_alerts_step)
         if self.build_signals:
             await self._step(conn, "rules", rule_step)
             if s.telegram_bot_token:
@@ -309,9 +321,14 @@ class Ingestor:
         await self._slow(conn, "buybacks", H(2), lambda: buybacks.refresh_window(self.sec, conn, 560))
         await self._slow(conn, "earnings", M(55), lambda: earnings.refresh(conn, ahead_days=30, history_days=560))
         await self._slow(conn, "fx", H(6), lambda: euronext.refresh_fx(conn, self.euronext))
+        await self._slow(conn, "sectors", M(10), lambda: company.refresh(self.sec, conn))
+        await self._slow(conn, "job_runs_purge", H(24), lambda: _purge_runs(conn))
         if s.amf_enabled:
             await self._slow(conn, "eu_prices", M(25), lambda: euronext.refresh_prices(
                 conn, self.euronext, backtest.store_history))
+            await self._slow(conn, "amf_history", M(30), lambda: amf.backfill_history(self.amf, conn))
+            await self._slow(conn, "amf_history_queue", M(10), lambda: amf.process_queue(
+                self.amf, conn, limit=150, stop=self.stop, recent=False))
         if s.bafin_enabled:
             async def bafin_step():
                 has = await _count(conn, "SELECT count(*) AS n FROM bafin_trades")
@@ -359,3 +376,15 @@ async def _wrap(key: str, coro):
 async def _async_value(v):
     return v
 
+
+
+async def _run_log(conn, name: str, duration: float, ok: bool, error: str | None) -> None:
+    await conn.execute("INSERT INTO job_runs (name, duration_s, ok, error) VALUES (%s,%s,%s,%s)",
+                       (name, duration, ok, error))
+    await conn.commit()
+
+
+async def _purge_runs(conn) -> dict:
+    cur = await conn.execute("DELETE FROM job_runs WHERE finished_at < now() - interval '7 days'")
+    await conn.commit()
+    return {"deleted": cur.rowcount}

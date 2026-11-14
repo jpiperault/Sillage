@@ -102,3 +102,20 @@ def test_score_model():
     p = model.predict(m, fs)
     assert 0.6 < p < 0.7 and model.percentile(m, p) == 69
     assert model.explain(m, fs, p)[0].startswith("Cluster de 3 initiés ou plus (+")
+
+
+def test_sectors_and_v2_features():
+    from sillage.ingest import company
+    assert company.sector_for("2834") == "Santé" and company.sector_for("7372") == "Technologie"
+    assert company.sector_for("6798") == "Immobilier" and company.sector_for("6022") == "Finance"
+    assert company.sector_for("1311") == "Énergie" and company.sector_for(None) is None
+    fs = model.features_congress(amount_min=60000, delay=40, cluster=2, chamber="Senate", track_wins=0.3)
+    assert fs == ["amount=50-250K", "delay=>30", "cluster=2", "chamber=Sénat", "track=bad"]
+    fe = model.features_europe(role_class="top", value=10_000, delay=1, cluster=0, track_wins=None)
+    assert fe == ["role=top", "value=<50K", "delay=<=2"]
+    from sillage import backtest
+    assert backtest.europe_role_class("bafin", "Vorstand") == "top"
+    assert backtest.europe_role_class("amf", "Directeur Général") == "top"
+    assert backtest.europe_role_class("amf", None) == "close"
+    small = model.fit_samples([(date(2026, 1, 1), ["a"], 1, 0.1)] * 10, 300)
+    assert small["model"] is None and "pas assez" in small["metrics"]["reason"]

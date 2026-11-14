@@ -183,10 +183,51 @@ async def poll_list(client: AmfClient, conn) -> int:
     return new
 
 
+HISTORY_LIMIT = 10_000  # l'API BDIF ne pagine pas au-delà
+
+
+async def backfill_history(client: AmfClient, conn, pages: int = 5) -> dict:
+    """Remonte l'historique des déclarations, quelques pages par passage, jusqu'à la limite de l'API."""
+    await conn.execute("INSERT INTO amf_history_state (id) VALUES (1) ON CONFLICT DO NOTHING")
+    cur = await conn.execute("SELECT next_offset, done FROM amf_history_state WHERE id=1")
+    st = await cur.fetchone()
+    await conn.commit()
+    if st["done"]:
+        return {"done": True}
+    offset, new = st["next_offset"], 0
+    for _ in range(pages):
+        if offset >= HISTORY_LIMIT:
+            break
+        resp = await client.get(LIST_URL.format(size=PAGE_SIZE, start=offset))
+        resp.raise_for_status()
+        items = resp.json().get("result") or []
+        for it in items:
+            docs = [d for d in (it.get("documents") or []) if d.get("accessible") and d.get("path")]
+            if not docs or not it.get("numero"):
+                continue
+            company = next((s.get("raisonSociale") for s in it.get("societes") or []
+                            if s.get("role") == "SocieteConcernee"), None)
+            c = await conn.execute(
+                "INSERT INTO amf_filings (numero, path, company, published) VALUES (%s,%s,%s,%s)"
+                " ON CONFLICT (numero) DO NOTHING",
+                (it["numero"], docs[0]["path"], company, _parse_dt(it.get("datePublication"))))
+            new += c.rowcount
+        offset += PAGE_SIZE
+        done = len(items) < PAGE_SIZE or offset >= HISTORY_LIMIT
+        await conn.execute("UPDATE amf_history_state SET next_offset=%s, done=%s WHERE id=1", (offset, done))
+        await conn.commit()
+        if done:
+            break
+    return {"offset": offset, "new": new}
+
+
 async def process_queue(client: AmfClient, conn, limit: int = BATCH_SIZE,
-                        stop: asyncio.Event | None = None) -> dict:
+                        stop: asyncio.Event | None = None, recent: bool | None = None) -> dict:
+    """recent=True : déclarations de moins de 7 jours (boucle rapide) ; False : plus anciennes (boucle lente)."""
+    cond = "" if recent is None else (" AND published >= current_date - 7" if recent
+                                      else " AND (published < current_date - 7 OR published IS NULL)")
     cur = await conn.execute(
-        "SELECT numero, path, company, published FROM amf_filings WHERE status='pending'"
+        "SELECT numero, path, company, published FROM amf_filings WHERE status='pending'" + cond +
         " ORDER BY published DESC NULLS LAST LIMIT %s", (limit,))
     rows = await cur.fetchall()
     await conn.commit()

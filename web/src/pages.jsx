@@ -4,6 +4,7 @@ import { Notice, Score, Seg, SignalTable, useApi } from './components.jsx'
 import Ticket from './Ticket.jsx'
 import { Alerts, Backtest, Settings } from './extra.jsx'
 import { ExportLink, ModelPanel, TopPeople } from './v2.jsx'
+import { AdminUsers, PriceAlerts } from './v21.jsx'
 import { date, datetime, int, money, moneyCur, pct, signed, tone, usd } from './format.js'
 
 const DAYS = [['3', '3 j'], ['7', '7 j'], ['30', '30 j'], ['90', '90 j']]
@@ -64,17 +65,17 @@ function Convergence({ onTicker }) {
   return (
     <section className="panel" aria-label="Convergence">
       <h2>Convergence <span className="muted small">30 j</span></h2>
-      <p className="muted small">Tickers où plusieurs sources se rejoignent : initiés acheteurs, élus acheteurs, 13D.</p>
+      <p className="muted small">Tickers où plusieurs sources se rejoignent : initiés acheteurs, élus acheteurs, 13D, grands fonds (13F : ligne ouverte ou renforcée au dernier trimestre).</p>
       {!data?.items?.length ? <p className="muted">Pas encore de convergence.</p> : (
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Ticker</th><th className="r">Initiés</th><th className="r">Élus</th><th className="r">13D</th><th className="r">Score</th></tr></thead>
+            <thead><tr><th>Ticker</th><th className="r">Initiés</th><th className="r">Élus</th><th className="r">13D</th><th className="r">13F</th><th className="r">Score</th></tr></thead>
             <tbody>
               {data.items.slice(0, 10).map((c) => (
                 <tr key={c.ticker}>
                   <td><button type="button" className="row-btn ticker" onClick={() => onTicker(c.ticker)} title={c.name || ''}>{c.ticker}</button></td>
                   <td className="r num">{c.insiders}</td><td className="r num">{c.congress}</td>
-                  <td className="r num">{c.ownership}</td><td className="r"><Score value={c.score} /></td>
+                  <td className="r num">{c.ownership}</td><td className="r num">{c.funds}</td><td className="r"><Score value={c.score} /></td>
                 </tr>
               ))}
             </tbody>
@@ -554,6 +555,7 @@ export function Account({ me, onLogout }) {
           <Notice msg={msg} />
         </section>
         <Alerts />
+        <PriceAlerts />
         <section className="panel" aria-label="Watchlist">
           <h2>Watchlist</h2>
           {!watch.data?.items?.length ? <p className="muted">Vide. Ajoutez un ticker depuis un ticket de copie.</p> : (
@@ -616,7 +618,7 @@ export function Account({ me, onLogout }) {
         </div>
         <Notice msg={adminMsg} />
       </section>
-      {me.user.is_admin && <div style={{ gridColumn: '1 / -1' }}><Settings /></div>}
+      {me.user.is_admin && <div style={{ gridColumn: '1 / -1' }}><Settings /><AdminUsers /><p className="small"><a href="#sante">Page Santé de l'application →</a></p></div>}
     </div>
   )
 }

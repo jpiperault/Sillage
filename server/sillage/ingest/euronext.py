@@ -19,6 +19,7 @@ VENUE_MIC = [("growth", "ALXP"), ("access", "XMLI"), ("alternext", "ALXP"), ("pa
              ("amsterdam", "XAMS"), ("brussels", "XBRU"), ("bruxelles", "XBRU"), ("lisbon", "XLIS"),
              ("milan", "MTAA"), ("dublin", "XMSM"), ("oslo", "XOSL")]
 MICS_TRIED = ("XPAR", "ALXP", "XMLI")
+EU_BENCHMARK = "FR0007052782"  # ETF CAC 40
 
 
 def mic_for(venue: str | None) -> list[str]:
@@ -97,15 +98,20 @@ async def eur_usd(conn) -> float | None:
 
 async def refresh_prices(conn, client: EuronextClient, store_history, limit: int = 60) -> dict:
     """Cours des ISIN suivis (déclarations AMF récentes, positions et watchlist) : historique + dernier cours."""
+    # Récents (signaux < 200 j, positions, watchlist, référence CAC 40) : rechargés chaque jour ;
+    # anciens (historique pour le score v2 Europe) : chargés une fois.
     cur = await conn.execute(
-        """SELECT t.isin, max(t.venue) AS venue FROM (
-             SELECT isin, venue FROM amf_trades WHERE published >= current_date - 120 AND isin IS NOT NULL
-             UNION ALL SELECT isin, venue FROM bafin_trades WHERE published >= current_date - 120 AND isin LIKE 'FR%%'
-             UNION ALL SELECT ticker, NULL FROM paper_positions WHERE ticker ~ '^[A-Z]{2}[A-Z0-9]{9}[0-9]$'
-             UNION ALL SELECT ticker, NULL FROM watchlist WHERE ticker ~ '^[A-Z]{2}[A-Z0-9]{9}[0-9]$') t
+        """SELECT t.isin, max(t.venue) AS venue, bool_or(t.recent) AS recent FROM (
+             SELECT isin, venue, published >= current_date - 200 AS recent FROM amf_trades WHERE isin IS NOT NULL
+             UNION ALL SELECT isin, venue, true FROM bafin_trades WHERE published >= current_date - 200
+               AND isin LIKE 'FR%%'
+             UNION ALL SELECT ticker, NULL, true FROM paper_positions WHERE ticker ~ '^[A-Z]{2}[A-Z0-9]{9}[0-9]$'
+             UNION ALL SELECT ticker, NULL, true FROM watchlist WHERE ticker ~ '^[A-Z]{2}[A-Z0-9]{9}[0-9]$'
+             UNION ALL SELECT %s, 'Euronext Paris', true) t
            LEFT JOIN price_history_state s ON s.ticker = t.isin
-           WHERE s.ticker IS NULL OR s.fetched_at < now() - interval '20 hours'
-           GROUP BY t.isin ORDER BY t.isin LIMIT %s""", (limit,))
+           GROUP BY t.isin, s.ticker, s.fetched_at
+           HAVING s.ticker IS NULL OR (bool_or(t.recent) AND s.fetched_at < now() - interval '20 hours')
+           ORDER BY bool_or(t.recent) DESC, t.isin LIMIT %s""", (EU_BENCHMARK, limit))
     todo = await cur.fetchall()
     await conn.commit()
     ok = 0

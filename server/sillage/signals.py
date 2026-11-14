@@ -21,20 +21,36 @@ def _f(x):
 
 # ---------------------------------------------------------------- modèle actif (cache 10 min)
 
-_model_cache: dict = {"at": 0.0, "row": None}
+_model_cache: dict = {}
 
 
-async def active_model(conn) -> dict | None:
-    if time.monotonic() - _model_cache["at"] > 600:
-        cur = await conn.execute("SELECT id, model, metrics, active, created_at FROM score_models WHERE side='P'"
-                                 " ORDER BY id DESC LIMIT 1")
-        _model_cache["row"] = await cur.fetchone()
-        _model_cache["at"] = time.monotonic()
-    return _model_cache["row"]
+async def active_model(conn, side: str = "P") -> dict | None:
+    """Dernier modèle de la source (P = initiés US, congress, europe), en cache 10 minutes."""
+    at, row = _model_cache.get(side, (0.0, None))
+    if time.monotonic() - at > 600:
+        cur = await conn.execute("SELECT id, model, metrics, active, created_at FROM score_models WHERE side=%s"
+                                 " ORDER BY id DESC LIMIT 1", (side,))
+        row = await cur.fetchone()
+        _model_cache[side] = (time.monotonic(), row)
+    return row
 
 
 def reset_model_cache() -> None:
-    _model_cache["at"] = 0.0
+    _model_cache.clear()
+
+
+def _apply_v2(sig: dict, mdl: dict | None, fs: list[str]) -> None:
+    if mdl is None:
+        return
+    m = mdl["model"]
+    p = score_model.predict(m, fs)
+    sig["score_v1"] = sig["score"]
+    sig["score"] = score_model.percentile(m, p)
+    sig["probability"] = round(p * 100, 1)
+    sig["score_version"] = "v2"
+    info = [x for x in sig["reasons"] if x.startswith("Info")]
+    sig["reasons"] = ([f"Probabilité de battre le marché à 3 mois : {p * 100:.0f} % (meilleure que {sig['score']} %"
+                       " des signaux passés)"] + score_model.explain(m, fs, p) + info)
 
 
 def use_v2(row: dict | None, version: str) -> bool:
@@ -210,7 +226,8 @@ def insider_signal(r: dict, cluster: int, current: float | None, ctx: dict | Non
 
 # ---------------------------------------------------------------- élus
 
-def congress_signal(r: dict, cluster: int, current: float | None, track: dict | None = None) -> dict:
+def congress_signal(r: dict, cluster: int, current: float | None, track: dict | None = None,
+                    mdl: dict | None = None) -> dict:
     delay = scoring.days_between(r["trade_date"], r["report_date"])
     score, reasons = scoring.congress_score(side=r["side"], amount_min=_f(r["amount_min"]), delay_days=delay,
                                             cluster=cluster if r["side"] == "buy" else 0)
@@ -218,15 +235,20 @@ def congress_signal(r: dict, cluster: int, current: float | None, track: dict | 
         reasons.append("Info : " + track_text(track))
     chamber = {"House": "Représentant", "Senate": "Sénateur"}.get(r["chamber"] or "", r["chamber"])
     role = " · ".join(x for x in (chamber, r["party"], r.get("state_dst")) if x) or "Élu"
-    return {
+    sig = {
         "id": f"c{r['id']}", "source": "congress", "ticker": r["ticker"], "company": None,
         "person": r["politician"], "role": role, "side": r["side"], "code": None, "shares": None, "price": None,
         "value": _f(r["amount_min"]), "amount_range": r["amount_range"], "trade_date": r["trade_date"],
         "filed_date": r["report_date"], "delay_days": delay, "plan_10b5_1": False, "cluster": cluster,
         "score": score, "score_v1": score, "score_version": "v1", "reasons": reasons, "current_price": current,
         "change_pct": None, "url": r.get("url"), "congress_source": r.get("source"),
-        "track": dict(track) if track else None,
+        "track": dict(track) if track else None, "probability": None,
     }
+    if r["side"] == "buy" and mdl is not None:
+        tw = (track["wins"] / track["n"]) if track and track["n"] >= backtest.TRACK_MIN else None
+        _apply_v2(sig, mdl, score_model.features_congress(amount_min=_f(r["amount_min"]), delay=delay, cluster=cluster,
+                                                          chamber=r["chamber"], track_wins=tw))
+    return sig
 
 
 # ---------------------------------------------------------------- Europe (AMF, BaFin)
@@ -250,7 +272,8 @@ def _europe_role(source: str, role: str | None) -> tuple[str | None, bool, bool,
     return (None if closely else role), (bool(role) and not closely), False, role or "Dirigeant"
 
 
-def europe_signal(r: dict, cluster: int, source: str, current_eur: float | None) -> dict:
+def europe_signal(r: dict, cluster: int, source: str, current_eur: float | None, mdl: dict | None = None,
+                  track: dict | None = None) -> dict:
     delay = scoring.days_between(r["trade_date"], r["published"])
     code = "P" if r["side"] == "buy" else "S"
     title, officer, director, role_label = _europe_role(source, r["role"])
@@ -265,7 +288,7 @@ def europe_signal(r: dict, cluster: int, source: str, current_eur: float | None)
     price = _f(r["price"])
     change = (current_eur / price - 1) if current_eur and price else None
     cur_code = "EUR" if (r["currency"] or "EUR").upper().startswith("EUR") else r["currency"]
-    return {
+    sig = {
         "id": f"{'a' if source == 'amf' else 'b'}{r['id']}", "source": source, "ticker": None,
         "symbol": r["isin"], "company": r["company"], "person": r["person"], "role": role_label,
         "side": r["side"], "code": code, "shares": _f(r["volume"]), "price": price, "value": _f(r["value"]),
@@ -273,8 +296,14 @@ def europe_signal(r: dict, cluster: int, source: str, current_eur: float | None)
         "delay_days": delay, "plan_10b5_1": False, "cluster": cluster, "score": score, "score_v1": score,
         "score_version": "v1", "reasons": reasons, "current_price": current_eur,
         "change_pct": round(change * 100, 2) if change is not None else None, "url": r.get("url"),
-        "isin": r["isin"], "venue": r["venue"], "country": "FR" if source == "amf" else "DE",
+        "isin": r["isin"], "venue": r["venue"], "country": "FR" if source == "amf" else "DE", "probability": None,
     }
+    if code == "P" and mdl is not None:
+        tw = (track["wins"] / track["n"]) if track and track["n"] >= backtest.TRACK_MIN else None
+        _apply_v2(sig, mdl, score_model.features_europe(role_class=backtest.europe_role_class(source, r["role"]),
+                                                        value=_f(r["value"]) or 0, delay=delay, cluster=cluster,
+                                                        track_wins=tw))
+    return sig
 
 
 INSIDER_GROUP_SQL = """
@@ -297,7 +326,7 @@ BAFIN_COLS = ("id, company, person, role, side, isin, price, currency, volume, v
 
 
 async def _europe(conn, table: str, cols: str, source: str, *, side: str, fast: bool, days: int,
-                  isin: str | None) -> list[dict]:
+                  isin: str | None, mdl: dict | None = None) -> list[dict]:
     where = ["published >= current_date - %s::int"]
     args: list = [days]
     if side != "all":
@@ -319,7 +348,7 @@ async def _europe(conn, table: str, cols: str, source: str, *, side: str, fast: 
             " AND coalesce(trade_date, published) >= current_date - 30 GROUP BY isin", (isins,))
         clusters = {r["isin"]: r["n"] for r in await cur.fetchall()}
     pmap = await _price_map(conn, isins)
-    return [europe_signal(r, clusters.get(r["isin"], 0), source, pmap.get(r["isin"])) for r in rows]
+    return [europe_signal(r, clusters.get(r["isin"], 0), source, pmap.get(r["isin"]), mdl) for r in rows]
 
 
 async def build(conn, *, source: str = "all", side: str = "all", fast: bool = False, days: int = 7,
@@ -366,15 +395,19 @@ async def build(conn, *, source: str = "all", side: str = "all", fast: bool = Fa
         clusters = await _congress_clusters(conn, tickers)
         pmap = await _price_map(conn, tickers)
         tracks = await congress_tracks(conn, sorted({r["politician"] for r in rows}))
-        out += [congress_signal(r, clusters.get(r["ticker"], 0), pmap.get(r["ticker"]), tracks.get(r["politician"]))
+        cm = await active_model(conn, "congress")
+        cm = cm if use_v2(cm, score_version) else None
+        out += [congress_signal(r, clusters.get(r["ticker"], 0), pmap.get(r["ticker"]), tracks.get(r["politician"]), cm)
                 for r in rows]
     if side in ("all", "buy", "sell") and (not ticker or is_isin):
+        em = await active_model(conn, "europe")
+        em = em if use_v2(em, score_version) else None
         if source in ("all", "europe", "amf"):
             out += await _europe(conn, "amf_trades", AMF_COLS, "amf", side=side, fast=fast, days=days,
-                                 isin=ticker if is_isin else None)
+                                 isin=ticker if is_isin else None, mdl=em)
         if source in ("all", "europe", "bafin"):
             out += await _europe(conn, "bafin_trades", BAFIN_COLS, "bafin", side=side, fast=fast, days=days,
-                                 isin=ticker if is_isin else None)
+                                 isin=ticker if is_isin else None, mdl=em)
     await conn.commit()
     return out
 

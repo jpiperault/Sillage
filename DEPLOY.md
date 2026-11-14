@@ -183,6 +183,28 @@ qui pèsent le plus et le score v1 pour comparaison. Élus et Europe gardent le 
   courbe comparée au S&P 500. Actions européennes : cours Euronext converti au taux BCE.
 - **Exports CSV** (séparateur « ; », compatibles Excel) : signaux, journal fictif, rapport de backtest, 13F.
 
+## Nouveautés v2.1
+
+- **Tester une règle sur l'historique** (Entraînement → Règle automatique) : rejeu jour par jour des 18 mois
+  d'achats d'initiés avec le score, la part par ligne, l'horizon, le stop et les frais choisis ; courbe comparée
+  au S&P 500, pire baisse, part de trades gagnants. En score v2, seule la période de test du modèle est rejouée.
+- **Comptes** (Compte → Comptes, admin) : désactiver / réactiver (sessions coupées), mot de passe temporaire
+  affiché une fois, droits admin, suppression (avec portefeuilles et watchlist).
+- **Santé** (onglet réservé à l'admin) : version, mémoire, taille de la base et des tables, files d'attente,
+  sources bloquées, durée et erreurs de chaque tâche sur 24 h (historique gardé 7 jours).
+- **Marché** : part des initiés acheteurs semaine par semaine (hors plans 10b5-1) avec le S&P 500, et par secteur
+  (code SIC de la SEC, regroupé en 12 secteurs).
+- **Entraînement** : vente partielle, stop réglable, stop suiveur (monte avec le plus haut), objectif de cours,
+  note par ligne.
+- **Alertes de cours** (Compte, fiche action) : au-dessus / en dessous d'un prix ; le titre passe en watchlist pour
+  que son cours soit suivi ; notification Telegram si le compte est lié, rappel dans le Résumé.
+- **Score v2 pour les élus et l'Europe** : même méthode, référence S&P 500 (élus) ou ETF CAC 40 (Europe), activé
+  seulement quand au moins 300 achats mesurés valident le modèle ; l'historique AMF est remonté progressivement.
+- **13F dans la convergence** : fonds suivis ayant ouvert ou renforcé la ligne au dernier trimestre déposé
+  (au moins un signal récent d'une autre source reste exigé).
+- **Réseau d'un initié** (clic sur son nom dans un ticket) : ses sociétés, rôles, achats/ventes, track record et
+  les autres initiés des mêmes sociétés.
+
 ## Alertes Telegram
 
 1. Dans Telegram, écrire à **@BotFather**, commande `/newbot`, choisir un nom : il donne un jeton `123456:ABC…`.

@@ -10,7 +10,7 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
-from . import alerts, backtest, model as score_model, paper, rules, scoring, security, settings_store
+from . import alerts, backtest, model as score_model, paper, rules, scoring, security, settings_store, simulate
 from . import signals as signals_mod
 from .ingest import euronext, finra, funds as funds13f, prices, senate, usaspending
 
@@ -54,9 +54,10 @@ async def current_user(request: Request) -> dict:
         raise HTTPException(401, "Session expirée. Reconnectez-vous.")
     user_id, tv = parsed
     async with _state(request).pool.connection() as conn:
-        cur = await conn.execute("SELECT id, email, is_admin, token_version FROM users WHERE id=%s", (user_id,))
+        cur = await conn.execute("SELECT id, email, is_admin, token_version, disabled FROM users WHERE id=%s",
+                                 (user_id,))
         user = await cur.fetchone()
-    if not user or user["token_version"] != tv:
+    if not user or user["token_version"] != tv or user["disabled"]:
         raise HTTPException(401, "Session expirée. Reconnectez-vous.")
     return user
 
@@ -129,12 +130,14 @@ async def login(body: Credentials, request: Request, response: Response):
     email = body.email.strip().lower()
     async with st.pool.connection() as conn:
         cur = await conn.execute(
-            "SELECT id, email, is_admin, token_version, password_hash FROM users WHERE email=%s", (email,)
+            "SELECT id, email, is_admin, token_version, password_hash, disabled FROM users WHERE email=%s", (email,)
         )
         user = await cur.fetchone()
         ok = security.check_password(body.password, user["password_hash"] if user else security.DUMMY_HASH)
         if not user or not ok:
             raise HTTPException(401, "E-mail ou mot de passe incorrect.")
+        if user["disabled"]:
+            raise HTTPException(403, "Ce compte est désactivé. Contactez l'administrateur.")
         await conn.execute("UPDATE users SET last_login_at=now() WHERE id=%s", (user["id"],))
         await conn.commit()
     _set_cookie(request, response, security.make_token(st.settings.jwt_secret, user["id"], user["token_version"]))
@@ -473,18 +476,34 @@ async def convergence(request: Request, user: dict = Depends(current_user)):
                             AND coalesce(report_date, trade_date) >= current_date - 30 GROUP BY ticker),
                     o AS (SELECT ticker, count(*) n, max(subject_name) AS name FROM ownership_filings
                           WHERE ticker IS NOT NULL AND form_type LIKE '13D%'
-                            AND filed_date >= current_date - 30 GROUP BY ticker)
+                            AND filed_date >= current_date - 30 GROUP BY ticker),
+                    -- 13F : fonds suivis qui ont ouvert ou renforcé (+5 %) la ligne au dernier trimestre déposé
+                    latest AS (SELECT DISTINCT ON (cik) cik, accession, period FROM fund_filings
+                               WHERE filed_date >= current_date - 135 ORDER BY cik, period DESC),
+                    prev AS (SELECT DISTINCT ON (f.cik) f.cik, f.accession FROM fund_filings f
+                             JOIN latest l USING (cik) WHERE f.period < l.period ORDER BY f.cik, f.period DESC),
+                    f AS (SELECT t.ticker, count(DISTINCT l.cik) n FROM latest l
+                          JOIN prev p USING (cik)
+                          JOIN fund_holdings h ON h.accession = l.accession AND h.put_call = ''
+                          JOIN cusip_tickers t ON t.cusip = h.cusip AND t.ticker IS NOT NULL
+                          LEFT JOIN fund_holdings ph ON ph.accession = p.accession AND ph.cusip = h.cusip
+                                                     AND ph.put_call = ''
+                          WHERE ph.shares IS NULL OR h.shares >= ph.shares * 1.05 GROUP BY t.ticker)
                SELECT t.ticker, coalesce(i.name, o.name) AS name,
-                      coalesce(i.n,0) AS insiders, coalesce(c.n,0) AS congress, coalesce(o.n,0) AS ownership
-               FROM (SELECT ticker FROM i UNION SELECT ticker FROM c UNION SELECT ticker FROM o) t
-               LEFT JOIN i USING (ticker) LEFT JOIN c USING (ticker) LEFT JOIN o USING (ticker)
-               WHERE coalesce(i.n,0) + coalesce(c.n,0) + coalesce(o.n,0) >= 2"""
+                      coalesce(i.n,0) AS insiders, coalesce(c.n,0) AS congress, coalesce(o.n,0) AS ownership,
+                      coalesce(f.n,0) AS funds
+               FROM (SELECT ticker FROM i UNION SELECT ticker FROM c UNION SELECT ticker FROM o
+                     UNION SELECT ticker FROM f) t
+               LEFT JOIN i USING (ticker) LEFT JOIN c USING (ticker) LEFT JOIN o USING (ticker) LEFT JOIN f USING (ticker)
+               WHERE (coalesce(i.n,0) + coalesce(c.n,0) + coalesce(o.n,0) >= 1)
+                 AND coalesce(i.n,0) + coalesce(c.n,0) + coalesce(o.n,0) + coalesce(f.n,0) >= 2"""
         )
         rows = await cur.fetchall()
         await conn.commit()
     items = []
     for r in rows:
-        score = scoring.convergence_score(insiders=r["insiders"], congress=r["congress"], ownership=r["ownership"])
+        score = scoring.convergence_score(insiders=r["insiders"], congress=r["congress"], ownership=r["ownership"],
+                                          funds=r["funds"])
         items.append({**r, "score": score})
     items.sort(key=lambda x: (x["score"], x["insiders"]), reverse=True)
     return {"items": items[:30]}
@@ -597,7 +616,7 @@ async def paper_order(body: PaperOrder, request: Request, user: dict = Depends(c
                 res = await paper.buy(conn, user["id"], t, body.quantity, px, st.settings.paper_start_cash,
                                       body.signal_ref, book=body.book, currency=currency)
             else:
-                res = await paper.sell_all(conn, user["id"], t, px, book=body.book)
+                res = await paper.sell_all(conn, user["id"], t, px, book=body.book, quantity=body.quantity)
             await conn.commit()
         except paper.PaperError as exc:
             await conn.rollback()
@@ -967,11 +986,12 @@ async def ticker_page(ticker: str, request: Request, user: dict = Depends(curren
 
 
 @router.get("/model")
-async def model_info(request: Request, user: dict = Depends(current_user)):
+async def model_info(request: Request, side: Literal["P", "congress", "europe"] = "P",
+                     user: dict = Depends(current_user)):
     st = _state(request)
     async with st.pool.connection() as conn:
         cur = await conn.execute("SELECT created_at, metrics, active, model->'weights' AS weights FROM score_models"
-                                 " WHERE side='P' ORDER BY id DESC LIMIT 1")
+                                 " WHERE side=%s ORDER BY id DESC LIMIT 1", (side,))
         row = await cur.fetchone()
         await conn.commit()
     if not row:
@@ -1030,6 +1050,10 @@ async def summary(request: Request, user: dict = Depends(current_user)):
             """SELECT f.fund_name, f.period, f.filed_date FROM fund_filings f
                WHERE f.filed_date >= current_date - 7 ORDER BY f.filed_date DESC LIMIT 10""")
         new_13f = await cur.fetchall()
+        cur = await conn.execute(
+            "SELECT id, ticker, direction, price, triggered_at, triggered_price FROM price_alerts"
+            " WHERE user_id=%s AND triggered_at > now() - interval '3 days' ORDER BY triggered_at DESC", (user["id"],))
+        fired = await cur.fetchall()
         books = {}
         for book in paper.BOOKS:
             cur = await conn.execute("SELECT 1 FROM paper_accounts WHERE user_id=%s AND book=%s", (user["id"], book))
@@ -1045,7 +1069,7 @@ async def summary(request: Request, user: dict = Depends(current_user)):
     return {
         "date": today, "counts": {"signals_24h": len(recent), "buys_24h": len(buys)},
         "top_buys": buys[:10], "watch_signals": mine_sig[:10], "notices": notices, "earnings": upcoming,
-        "new_13f": new_13f, "books": books,
+        "new_13f": new_13f, "books": books, "price_alerts": fired,
     }
 
 
@@ -1121,3 +1145,358 @@ async def export_13f(cik: int, request: Request, user: dict = Depends(current_us
             ("put_call", "Option"), ("shares", "Actions"), ("prev_shares", "Actions trimestre précédent"),
             ("change_pct", "Variation (%)"), ("value", "Valeur ($)"), ("weight_pct", "Poids (%)")]
     return _csv(moves, cols, f"sillage-13f-{cik}-{date.today()}.csv")
+
+
+# ---------------------------------------------------------------- comptes (admin)
+
+
+@router.get("/admin/users")
+async def admin_users(request: Request, user: dict = Depends(admin_user)):
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT u.id, u.email, u.is_admin, u.disabled, u.created_at, u.last_login_at,
+                      (SELECT count(*) FROM watchlist w WHERE w.user_id = u.id) AS watchlist,
+                      (SELECT count(*) FROM paper_positions p WHERE p.user_id = u.id) AS positions,
+                      (SELECT count(*) FROM paper_orders o WHERE o.user_id = u.id) AS orders,
+                      (SELECT chat_id IS NOT NULL FROM user_alerts a WHERE a.user_id = u.id) AS telegram,
+                      (SELECT enabled FROM paper_rules r WHERE r.user_id = u.id) AS rule
+               FROM users u ORDER BY u.created_at""")
+        items = await cur.fetchall()
+        await conn.commit()
+    return {"items": items}
+
+
+class UserAction(BaseModel):
+    action: Literal["disable", "enable", "reset_password", "make_admin", "remove_admin"]
+
+
+@router.post("/admin/users/{user_id}")
+async def admin_user_action(user_id: int, body: UserAction, request: Request, user: dict = Depends(admin_user)):
+    if user_id == user["id"] and body.action in ("disable", "remove_admin"):
+        raise HTTPException(400, "Impossible sur votre propre compte.")
+    st = _state(request)
+    async with st.pool.connection() as conn:
+        cur = await conn.execute("SELECT email FROM users WHERE id=%s", (user_id,))
+        target = await cur.fetchone()
+        if not target:
+            raise HTTPException(404, "Compte introuvable.")
+        result: dict = {"ok": True}
+        if body.action == "disable":
+            await conn.execute("UPDATE users SET disabled=true, token_version=token_version+1 WHERE id=%s", (user_id,))
+            result["message"] = f"{target['email']} désactivé : ses sessions sont coupées."
+        elif body.action == "enable":
+            await conn.execute("UPDATE users SET disabled=false WHERE id=%s", (user_id,))
+            result["message"] = f"{target['email']} réactivé."
+        elif body.action == "reset_password":
+            import secrets
+            temp = secrets.token_urlsafe(12)
+            await conn.execute("UPDATE users SET password_hash=%s, token_version=token_version+1 WHERE id=%s",
+                               (security.hash_password(temp), user_id))
+            result.update(message=f"Mot de passe temporaire de {target['email']} (affiché une seule fois) :",
+                          temporary_password=temp)
+        elif body.action in ("make_admin", "remove_admin"):
+            await conn.execute("UPDATE users SET is_admin=%s WHERE id=%s", (body.action == "make_admin", user_id))
+            result["message"] = "Droits mis à jour."
+        await conn.commit()
+    return result
+
+
+@router.delete("/admin/users/{user_id}")
+async def admin_user_delete(user_id: int, request: Request, user: dict = Depends(admin_user)):
+    if user_id == user["id"]:
+        raise HTTPException(400, "Impossible de supprimer votre propre compte.")
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute("DELETE FROM users WHERE id=%s RETURNING email", (user_id,))
+        row = await cur.fetchone()
+        await conn.commit()
+    if not row:
+        raise HTTPException(404, "Compte introuvable.")
+    return {"ok": True, "message": f"{row['email']} supprimé, avec ses portefeuilles et sa watchlist."}
+
+
+# ---------------------------------------------------------------- santé (admin)
+
+STARTED_AT = date.today()
+
+
+def _rss_mb() -> float | None:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except OSError:
+        return None
+    return None
+
+
+@router.get("/admin/health")
+async def admin_health(request: Request, user: dict = Depends(admin_user)):
+    st = _state(request)
+    async with st.pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT j.name, j.last_run_at, j.last_ok_at, j.last_error_at, j.last_error,
+                      r.runs, r.errors, r.avg_s, r.max_s
+               FROM job_state j LEFT JOIN (
+                 SELECT name, count(*) AS runs, count(*) FILTER (WHERE NOT ok) AS errors,
+                        round(avg(duration_s), 1) AS avg_s, max(duration_s) AS max_s
+                 FROM job_runs WHERE finished_at > now() - interval '24 hours' GROUP BY name) r USING (name)
+               ORDER BY j.name""")
+        jobs = await cur.fetchall()
+        cur = await conn.execute(
+            """SELECT (SELECT count(*) FROM sec_filings WHERE status='pending') AS sec_pending,
+                      (SELECT count(*) FROM sec_filings WHERE status='error') AS sec_errors,
+                      (SELECT count(*) FROM house_filings WHERE status='pending') AS house_pending,
+                      (SELECT count(*) FROM amf_filings WHERE status='pending') AS amf_pending,
+                      (SELECT count(*) FROM amf_filings WHERE status='error') AS amf_errors,
+                      (SELECT count(*) FROM senate_filings WHERE status='pending') AS senate_pending,
+                      (SELECT count(*) FROM cusip_tickers WHERE ticker IS NULL) AS cusips_unmapped,
+                      (SELECT count(*) FROM (SELECT DISTINCT cusip FROM fund_holdings) h
+                         WHERE cusip NOT IN (SELECT cusip FROM cusip_tickers)) AS cusips_pending,
+                      (SELECT count(*) FROM price_history_state) AS histories,
+                      (SELECT count(*) FROM prices WHERE fetched_at < now() - interval '1 day') AS stale_prices,
+                      pg_database_size(current_database()) AS db_bytes""")
+        queues = await cur.fetchone()
+        cur = await conn.execute(
+            """SELECT relname AS name, pg_total_relation_size(relid) AS bytes, n_live_tup AS rows
+               FROM pg_stat_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 12""")
+        tables = await cur.fetchall()
+        cur = await conn.execute(
+            """SELECT name, finished_at, error FROM job_runs WHERE NOT ok AND finished_at > now() - interval '24 hours'
+               ORDER BY finished_at DESC LIMIT 30""")
+        errors = await cur.fetchall()
+        await conn.commit()
+    ing = st.ingestor
+    yahoo_off = getattr(st.prices, "_yahoo_off_until", 0)
+    import time as _time
+    return {
+        "version": __import__("sillage").__version__, "started": STARTED_AT, "memory_mb": _rss_mb(),
+        "loops": {"fast_running": bool(ing and ing.running), "slow_running": bool(ing and ing.running_slow),
+                  "interval_min": st.settings.ingest_interval_min, "ingest_enabled": st.settings.ingest_enabled},
+        "sources": {"yahoo_blocked": yahoo_off > _time.monotonic(), "senate_enabled": st.settings.senate_enabled,
+                    "telegram": bool(st.settings.telegram_bot_token), "quiver": bool(st.settings.quiver_api_key)},
+        "jobs": jobs, "queues": queues, "tables": tables, "errors": errors,
+    }
+
+
+# ---------------------------------------------------------------- indicateur de marché « initiés »
+
+
+MARKET_SQL = """
+WITH hist AS (
+  SELECT code, filed_date AS d, coalesce(owner_cik::text, owner_name) AS who, value, issuer_cik
+  FROM bt_signals WHERE code IN ('P','S') AND NOT plan_10b5_1 AND filed_date >= current_date - %(days)s::int),
+cutoff AS (SELECT coalesce(max(d), '1900-01-01'::date) AS m FROM hist),
+recent AS (
+  SELECT code, max(filed_date) AS d, max(coalesce(owner_cik::text, owner_name)) AS who, sum(value) AS value,
+         max(issuer_cik) AS issuer_cik
+  FROM insider_trades WHERE code IN ('P','S') AND amended_by IS NULL AND NOT plan_10b5_1
+    AND filed_date > (SELECT m FROM cutoff) GROUP BY accession, code),
+alls AS (SELECT * FROM hist UNION ALL SELECT * FROM recent)
+"""
+
+
+@router.get("/market/insiders")
+async def market_insiders(request: Request, weeks: int = Query(78, ge=8, le=104), user: dict = Depends(current_user)):
+    """Achats et ventes de tous les initiés par semaine (hors plans 10b5-1), avec le S&P 500, et par secteur."""
+    days = weeks * 7
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute(MARKET_SQL + """
+            SELECT w.*, (SELECT close FROM price_history h WHERE h.ticker='SPY' AND h.day <= w.week + 4
+                         ORDER BY h.day DESC LIMIT 1) AS spy
+            FROM (SELECT date_trunc('week', d)::date AS week,
+                         count(*) FILTER (WHERE code='P') AS buys, count(*) FILTER (WHERE code='S') AS sells,
+                         count(DISTINCT who) FILTER (WHERE code='P') AS buyers,
+                         count(DISTINCT who) FILTER (WHERE code='S') AS sellers,
+                         coalesce(sum(value) FILTER (WHERE code='P'), 0) AS buy_value,
+                         coalesce(sum(value) FILTER (WHERE code='S'), 0) AS sell_value
+                  FROM alls GROUP BY 1) w ORDER BY w.week""", {"days": days})
+        series = await cur.fetchall()
+        cur = await conn.execute(MARKET_SQL + """
+            SELECT coalesce(ci.sector, 'Inconnu') AS sector,
+                   count(DISTINCT who) FILTER (WHERE code='P' AND d >= current_date - 56) AS buyers_8w,
+                   count(DISTINCT who) FILTER (WHERE code='S' AND d >= current_date - 56) AS sellers_8w,
+                   count(DISTINCT who) FILTER (WHERE code='P') AS buyers_all,
+                   count(DISTINCT who) FILTER (WHERE code='S') AS sellers_all
+            FROM alls LEFT JOIN company_info ci ON ci.cik = alls.issuer_cik GROUP BY 1 ORDER BY 1""", {"days": days})
+        sectors = await cur.fetchall()
+        await conn.commit()
+    for r in series:
+        tot = r["buyers"] + r["sellers"]
+        r["ratio"] = round(r["buyers"] / tot * 100, 1) if tot else None
+    for r in sectors:
+        t8, ta = r["buyers_8w"] + r["sellers_8w"], r["buyers_all"] + r["sellers_all"]
+        r["ratio_8w"] = round(r["buyers_8w"] / t8 * 100, 1) if t8 else None
+        r["ratio_all"] = round(r["buyers_all"] / ta * 100, 1) if ta else None
+    ratios = [r["ratio"] for r in series if r["ratio"] is not None]
+    last4 = [r for r in series[-5:-1]] or series[-4:]
+    b4 = sum(r["buyers"] for r in last4)
+    s4 = sum(r["sellers"] for r in last4)
+    return {"series": series, "sectors": sectors,
+            "now": round(b4 / (b4 + s4) * 100, 1) if b4 + s4 else None,
+            "average": round(sum(ratios) / len(ratios), 1) if ratios else None,
+            "note": "Part des initiés acheteurs parmi les initiés actifs (acheteurs + vendeurs), hors plans 10b5-1."}
+
+
+# ---------------------------------------------------------------- réseau d'un initié
+
+
+@router.get("/insider/{cik}")
+async def insider_network(cik: int, request: Request, user: dict = Depends(current_user)):
+    st = _state(request)
+    key = str(cik)
+    async with st.pool.connection() as conn:
+        cur = await conn.execute(
+            """WITH t AS (
+                 SELECT issuer_cik, ticker, owner_name, code, value, filed_date, officer_title, relationship AS rel
+                 FROM bt_signals WHERE owner_cik=%(c)s
+                 UNION ALL
+                 SELECT max(issuer_cik), max(ticker), max(owner_name), code, sum(value), max(filed_date),
+                        max(officer_title),
+                        concat_ws(',', CASE WHEN bool_or(is_officer) THEN 'Officer' END,
+                                  CASE WHEN bool_or(is_director) THEN 'Director' END,
+                                  CASE WHEN bool_or(is_ten_percent) THEN 'TenPercentOwner' END)
+                 FROM insider_trades WHERE owner_cik=%(c)s AND amended_by IS NULL
+                   AND filed_date > (SELECT coalesce(max(filed_date), '1900-01-01') FROM bt_signals)
+                 GROUP BY accession, code)
+               SELECT t.issuer_cik, max(t.ticker) AS ticker, coalesce(max(ci.name), max(ct.title)) AS company,
+                      max(ci.sector) AS sector, max(t.officer_title) AS title, max(t.rel) AS relationship,
+                      count(*) FILTER (WHERE code='P') AS buys, count(*) FILTER (WHERE code='S') AS sells,
+                      coalesce(sum(value) FILTER (WHERE code='P'), 0) AS buy_value,
+                      coalesce(sum(value) FILTER (WHERE code='S'), 0) AS sell_value,
+                      max(filed_date) AS last, max(owner_name) AS name
+               FROM t LEFT JOIN company_info ci ON ci.cik = t.issuer_cik
+               LEFT JOIN cik_tickers ct ON ct.cik = t.issuer_cik
+               GROUP BY t.issuer_cik ORDER BY max(filed_date) DESC""", {"c": cik})
+        companies = await cur.fetchall()
+        if not companies:
+            raise HTTPException(404, "Aucune déclaration connue pour cet initié.")
+        issuers = [c["issuer_cik"] for c in companies if c["issuer_cik"]]
+        cur = await conn.execute(
+            """SELECT o.owner_cik, max(o.owner_name) AS name, count(DISTINCT o.issuer_cik) AS shared,
+                      array_agg(DISTINCT o.ticker) AS tickers
+               FROM (SELECT owner_cik, owner_name, issuer_cik, ticker FROM bt_signals WHERE issuer_cik = ANY(%(i)s)
+                     UNION ALL SELECT owner_cik, owner_name, issuer_cik, ticker FROM insider_trades
+                     WHERE issuer_cik = ANY(%(i)s)) o
+               WHERE o.owner_cik IS NOT NULL AND o.owner_cik <> %(c)s
+               GROUP BY o.owner_cik ORDER BY count(DISTINCT o.issuer_cik) DESC, max(o.owner_name) LIMIT 25""",
+            {"i": issuers, "c": cik})
+        peers = await cur.fetchall()
+        cur = await conn.execute("SELECT * FROM track_records WHERE kind='insider' AND person_key=%s", (key,))
+        track = await cur.fetchone()
+        sigs = []
+        cur = await conn.execute(
+            "SELECT DISTINCT ticker FROM insider_trades WHERE owner_cik=%s AND ticker IS NOT NULL", (cik,))
+        recent_tickers = [r["ticker"] for r in await cur.fetchall()]
+        for t in recent_tickers[:10]:
+            sigs += [x for x in await _build_signals(conn, source="insider", side="all", fast=False, days=365,
+                                                     ticker=t, limit=200, score_version=st.settings.score_version)
+                     if x.get("owner_cik") == cik]
+        await conn.commit()
+    sigs.sort(key=lambda x: x["filed_date"] or date.min, reverse=True)
+    for p in peers:
+        p["tickers"] = [t for t in (p["tickers"] or []) if t][:6]
+    return {"cik": cik, "name": companies[0]["name"], "companies": companies, "peers": peers,
+            "track": dict(track) if track else None, "signals": sigs[:50]}
+
+
+# ---------------------------------------------------------------- tester une règle sur l'historique
+
+_sim_cache: dict = {}
+
+
+class SimRequest(BaseModel):
+    score: Literal["v1", "v2"] = "v1"
+    min_score: int = Field(ge=0, le=100)
+    alloc_pct: float = Field(gt=0, le=20)
+    hold_days: int = Field(ge=5, le=400)
+    max_positions: int = Field(ge=1, le=200)
+    stop_pct: float = Field(default=8, gt=0, le=50)
+    cost_pct: float = Field(default=0.1, ge=0, le=2)
+
+
+@router.post("/paper/rule/simulate")
+async def rule_simulate(body: SimRequest, request: Request, user: dict = Depends(current_user)):
+    import time as _time
+    key = tuple(body.model_dump().items())
+    hit = _sim_cache.get(key)
+    if hit and _time.monotonic() - hit[0] < 3600:
+        return hit[1]
+    async with _state(request).pool.connection() as conn:
+        res = await simulate.simulate(conn, **body.model_dump())
+    if len(_sim_cache) > 50:
+        _sim_cache.clear()
+    _sim_cache[key] = (_time.monotonic(), res)
+    return res
+
+
+# ---------------------------------------------------------------- positions : stops, objectif, note
+
+
+class PositionUpdate(BaseModel):
+    book: Book = "manual"
+    stop_pct: float | None = Field(default=None, gt=0, le=90)
+    trailing_pct: float | None = Field(default=None, gt=0, le=90)
+    target_price: float | None = Field(default=None, gt=0)
+    note: str | None = Field(default=None, max_length=500)
+
+
+@router.put("/paper/positions/{ticker}")
+async def position_update(ticker: str, body: PositionUpdate, request: Request, user: dict = Depends(current_user)):
+    t = _ticker(ticker)
+    async with _state(request).pool.connection() as conn:
+        try:
+            res = await paper.update_position(conn, user["id"], body.book, t, stop_pct=body.stop_pct,
+                                              trailing_pct=body.trailing_pct, target_price=body.target_price,
+                                              note=body.note)
+            await conn.commit()
+        except paper.PaperError as exc:
+            await conn.rollback()
+            raise HTTPException(400, str(exc))
+    return res
+
+
+# ---------------------------------------------------------------- alertes de cours
+
+
+class PriceAlertIn(BaseModel):
+    ticker: str = Field(max_length=12)
+    direction: Literal["above", "below"]
+    price: float = Field(gt=0)
+
+
+@router.get("/price-alerts")
+async def price_alerts_get(request: Request, user: dict = Depends(current_user)):
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute(
+            """SELECT a.*, p.price AS last_price, p.currency FROM price_alerts a
+               LEFT JOIN prices p ON p.ticker = a.ticker WHERE a.user_id=%s
+               ORDER BY a.triggered_at DESC NULLS FIRST, a.created_at DESC""", (user["id"],))
+        items = await cur.fetchall()
+        await conn.commit()
+    return {"items": items}
+
+
+@router.post("/price-alerts")
+async def price_alerts_add(body: PriceAlertIn, request: Request, user: dict = Depends(current_user)):
+    t = _ticker(body.ticker)
+    async with _state(request).pool.connection() as conn:
+        cur = await conn.execute("SELECT count(*) AS n FROM price_alerts WHERE user_id=%s AND triggered_at IS NULL",
+                                 (user["id"],))
+        if (await cur.fetchone())["n"] >= 100:
+            raise HTTPException(400, "100 alertes actives au maximum.")
+        await conn.execute("INSERT INTO watchlist (user_id, ticker) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                           (user["id"], t))  # le cours d'un titre en watchlist est rafraîchi à chaque cycle
+        cur = await conn.execute("INSERT INTO price_alerts (user_id, ticker, direction, price) VALUES (%s,%s,%s,%s)"
+                                 " RETURNING id", (user["id"], t, body.direction, body.price))
+        aid = (await cur.fetchone())["id"]
+        await conn.commit()
+    return {"ok": True, "id": aid}
+
+
+@router.delete("/price-alerts/{alert_id}")
+async def price_alerts_delete(alert_id: int, request: Request, user: dict = Depends(current_user)):
+    async with _state(request).pool.connection() as conn:
+        await conn.execute("DELETE FROM price_alerts WHERE id=%s AND user_id=%s", (alert_id, user["id"]))
+        await conn.commit()
+    return {"ok": True}

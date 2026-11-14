@@ -72,6 +72,7 @@ def sql(query, params=()):
 
 def login(client, email, password):
     client.cookies.clear()
+    client.app_ref.state.limiter._hits.clear()  # les tests se connectent souvent depuis la même « IP »
     r = client.post("/api/v1/auth/login", json={"email": email, "password": password})
     assert r.status_code == 200, r.text
     return r
@@ -222,3 +223,120 @@ def test_rule_engine(client):
     assert "MSFT" in held and book["orders"][0]["reason"] == "rule"
     # 5 % de 25 000 $ = 1 250 $ : 3 actions MSFT à 400 $
     assert next(p for p in book["positions"] if p["ticker"] == "MSFT")["quantity"] == 3
+
+
+# ---------------------------------------------------------------- v2.1
+
+def test_positions_partial_trailing_target(client):
+    login(client, "u1@example.test", "nouveau-mdp-u1")
+    client.post("/api/v1/paper/reset")
+    assert client.post("/api/v1/paper/orders", json={"ticker": "AAPL", "side": "buy", "quantity": 10}).status_code == 200
+    r = client.post("/api/v1/paper/orders", json={"ticker": "AAPL", "side": "sell", "quantity": 4})
+    assert r.status_code == 200 and r.json()["remaining"] == 6
+    assert client.post("/api/v1/paper/orders", json={"ticker": "AAPL", "side": "sell", "quantity": 99}).status_code == 400
+    r = client.put("/api/v1/paper/positions/AAPL", json={"trailing_pct": 10, "target_price": 90, "note": "x"})
+    assert r.status_code == 400  # objectif sous le prix moyen
+    r = client.put("/api/v1/paper/positions/AAPL", json={"stop_pct": 5, "trailing_pct": 10, "target_price": 130,
+                                                          "note": "achat du CEO"})
+    assert r.status_code == 200 and r.json()["stop_price"] == pytest.approx(95.0)  # max(100×0,95 ; 100×0,90)
+    from sillage import paper
+
+    def run_stops():
+        async def go():
+            async with client.app_ref.state.pool.connection() as conn:
+                return await paper.apply_stops(conn)
+        return client.portal.call(go)
+    sql("INSERT INTO prices (ticker, price, currency) VALUES ('AAPL', 120, 'USD') ON CONFLICT (ticker)"
+        " DO UPDATE SET price=120, fetched_at=now()")
+    assert run_stops() == 0  # le stop suiveur monte : 120 × 0,9 = 108
+    pos = client.get("/api/v1/paper").json()["positions"][0]
+    assert pos["stop_price"] == pytest.approx(108.0) and pos["note"] == "achat du CEO"
+    sql("UPDATE prices SET price=107 WHERE ticker='AAPL'")
+    assert run_stops() == 1
+    orders = client.get("/api/v1/paper").json()["orders"]
+    assert orders[0]["reason"] == "trailing" and orders[0]["pnl"] == pytest.approx(6 * 7)
+    sql("UPDATE prices SET price=100 WHERE ticker='AAPL'")
+
+
+def test_price_alerts(client):
+    login(client, "u1@example.test", "nouveau-mdp-u1")
+    r = client.post("/api/v1/price-alerts", json={"ticker": "MSFT", "direction": "below", "price": 390})
+    assert r.status_code == 200
+    sql("INSERT INTO prices (ticker, price, currency) VALUES ('MSFT', 385, 'USD') ON CONFLICT (ticker)"
+        " DO UPDATE SET price=385")
+    from sillage import price_alerts
+
+    async def go():
+        async with client.app_ref.state.pool.connection() as conn:
+            return await price_alerts.check(conn, None, "")
+    assert client.portal.call(go)["triggered"] == 1
+    items = client.get("/api/v1/price-alerts").json()["items"]
+    assert items[0]["triggered_at"] and float(items[0]["triggered_price"]) == 385
+    assert client.get("/api/v1/summary").json()["price_alerts"]
+    assert "MSFT" in {w["ticker"] for w in client.get("/api/v1/watchlist").json()["items"]}
+
+
+def test_admin_users_and_health(client):
+    login(client, *ADMIN)
+    users = client.get("/api/v1/admin/users").json()["items"]
+    u1 = next(u for u in users if u["email"] == "u1@example.test")
+    assert client.post(f"/api/v1/admin/users/{u1['id']}", json={"action": "disable"}).json()["ok"]
+    client.cookies.clear()
+    r = client.post("/api/v1/auth/login", json={"email": "u1@example.test", "password": "nouveau-mdp-u1"})
+    assert r.status_code == 403
+    login(client, *ADMIN)
+    client.post(f"/api/v1/admin/users/{u1['id']}", json={"action": "enable"})
+    r = client.post(f"/api/v1/admin/users/{u1['id']}", json={"action": "reset_password"}).json()
+    temp = r["temporary_password"]
+    login(client, "u1@example.test", temp)
+    client.post("/api/v1/auth/password", json={"current_password": temp, "new_password": "nouveau-mdp-u1"})
+    assert client.get("/api/v1/admin/health").status_code == 403
+    login(client, *ADMIN)
+    me = next(u for u in client.get("/api/v1/admin/users").json()["items"] if u["email"] == ADMIN[0])
+    assert client.post(f"/api/v1/admin/users/{me['id']}", json={"action": "disable"}).status_code == 400
+    h = client.get("/api/v1/admin/health").json()
+    assert h["queues"]["db_bytes"] > 0 and h["tables"] and "jobs" in h and h["memory_mb"]
+
+
+def test_market_network_convergence(client):
+    login(client, "u1@example.test", "nouveau-mdp-u1")
+    m = client.get("/api/v1/market/insiders?weeks=8").json()
+    assert m["series"] and m["series"][-1]["buyers"] >= 1 and m["sectors"]
+    net = client.get("/api/v1/insider/1").json()
+    assert net["name"] == "Doe John" and net["companies"][0]["ticker"] == "ACME"
+    assert any(p["owner_cik"] == 2 and p["shared"] == 1 for p in net["peers"])  # même émetteur (CIK 123) en test
+    assert client.get("/api/v1/insider/999999").status_code == 404
+    # 13F : un fonds qui renforce ACME + un initié acheteur → convergence
+    sql("INSERT INTO fund_filings (accession, cik, fund_name, period, filed_date, total_value) VALUES"
+        " ('F1', 9, 'Fonds', current_date - 200, current_date - 150, 1000), ('F2', 9, 'Fonds', current_date - 110,"
+        " current_date - 60, 1000)")
+    sql("INSERT INTO fund_holdings (accession, cusip, put_call, issuer, shares, value) VALUES"
+        " ('F1', 'C1', '', 'ACME', 100, 10), ('F2', 'C1', '', 'ACME', 200, 20)")
+    sql("INSERT INTO cusip_tickers (cusip, ticker) VALUES ('C1', 'ACME')")
+    conv = {c["ticker"]: c for c in client.get("/api/v1/convergence").json()["items"]}
+    assert conv["ACME"]["funds"] == 1 and conv["ACME"]["insiders"] >= 1
+
+
+def test_rule_simulation(client):
+    login(client, "u1@example.test", "nouveau-mdp-u1")
+    base = date.today() - timedelta(days=300)
+    days = [base + timedelta(days=i) for i in range(260) if (base + timedelta(days=i)).weekday() < 5]
+    for t, f in (("SPY", lambda i: 100 + i * 0.1), ("IWM", lambda i: 100), ("GAIN", lambda i: 10 + i * 0.05),
+                 ("LOSS", lambda i: 10 - i * 0.02)):
+        sql("DELETE FROM price_history WHERE ticker=%s", (t,))
+        with psycopg.connect(URL, autocommit=True) as c:
+            c.cursor().executemany("INSERT INTO price_history (ticker, day, close, idx) VALUES (%s,%s,%s,%s)",
+                                   [(t, d, f(i), i) for i, d in enumerate(days)])
+    for i, (t, owner) in enumerate((("GAIN", 11), ("LOSS", 12))):
+        sql("""INSERT INTO bt_signals (accession, code, quarter, ticker, issuer_cik, owner_cik, owner_name, relationship,
+                 officer_title, shares, value, price, shares_after, trade_date, filed_date, plan_10b5_1)
+               VALUES (%s,'P','2026q1',%s,%s,%s,'X','Officer','CEO',1000,10000,10,2000,%s,%s,false)""",
+            (f"BT{i}", t, 500 + i, owner, days[10], days[11]))
+    r = client.post("/api/v1/paper/rule/simulate", json={"score": "v1", "min_score": 0, "alloc_pct": 10,
+                                                         "hold_days": 60, "max_positions": 5}).json()
+    assert r["trades"] == 2 and r["exits"]["horizon"] >= 1 and r["bench_pct"] > 0
+    best = r["best"][0]
+    assert best["ticker"] == "GAIN" and best["ret"] > 0 and r["curve"]
+    r2 = client.post("/api/v1/paper/rule/simulate", json={"score": "v1", "min_score": 101, "alloc_pct": 10,
+                                                          "hold_days": 60, "max_positions": 5})
+    assert r2.status_code == 422

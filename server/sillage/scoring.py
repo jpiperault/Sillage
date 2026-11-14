@@ -143,7 +143,9 @@ def congress_score(
     return _clamp(score), reasons
 
 
-def convergence_score(*, insiders: int, congress: int, ownership: int) -> int:
-    sources = sum(1 for n in (insiders, congress, ownership) if n > 0)
-    raw = 20 * sources + 6 * min(insiders, 4) + 6 * min(congress, 4) + 10 * min(ownership, 2)
+def convergence_score(*, insiders: int, congress: int, ownership: int, funds: int = 0) -> int:
+    """Le 13F (grands fonds) compte comme une source, mais une convergence exige au moins un signal récent
+    (initiés, élus ou 13D) : un 13F a jusqu'à 4 mois et demi de retard."""
+    sources = sum(1 for n in (insiders, congress, ownership, funds) if n > 0)
+    raw = 20 * sources + 6 * min(insiders, 4) + 6 * min(congress, 4) + 10 * min(ownership, 2) + 6 * min(funds, 4)
     return min(100, raw)

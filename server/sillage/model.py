@@ -17,6 +17,7 @@ import random
 from . import backtest
 
 MIN_AUC = 0.53
+MIN_TEST = 500
 LABELS = {
     "role=Dirigeant de premier plan": "Dirigeant de premier plan (CEO, CFO…)",
     "role=Autre dirigeant ou administrateur": "Dirigeant ou administrateur",
@@ -27,8 +28,13 @@ LABELS = {
     "buyback": "Rachat d'actions annoncé récemment",
     "earnings_soon": "Résultats dans les 30 jours",
     "price<5": "Action à moins de 5 $",
-    "track=good": "Initié souvent gagnant par le passé",
-    "track=bad": "Initié souvent perdant par le passé",
+    "track=good": "Souvent gagnant par le passé",
+    "track=bad": "Souvent perdant par le passé",
+    "chamber=Sénat": "Sénateur",
+    "chamber=Chambre": "Représentant",
+    "role=top": "Dirigeant de premier plan",
+    "role=other": "Dirigeant ou administrateur",
+    "role=close": "Proche d'un dirigeant",
 }
 
 
@@ -123,6 +129,37 @@ def auc(scores: list[float], ys: list[int]) -> float | None:
     return (rank_sum - pos * (pos + 1) / 2) / (pos * neg)
 
 
+def features_congress(*, amount_min: float | None, delay: int | None, cluster: int, chamber: str | None,
+                      track_wins: float | None) -> list[str]:
+    f = ["amount=" + backtest._bucket(amount_min or 0, [(15_000, "<15K"), (50_000, "15-50K"), (250_000, "50-250K")],
+                                      ">=250K")]
+    if delay is not None:
+        f.append("delay=" + ("<=15" if delay <= 15 else "16-30" if delay <= 30 else ">30"))
+    if cluster >= 3:
+        f.append("cluster=3+")
+    elif cluster == 2:
+        f.append("cluster=2")
+    f.append("chamber=" + ("Sénat" if (chamber or "").lower().startswith("sen") else "Chambre"))
+    if track_wins is not None:
+        f.append("track=good" if track_wins >= 0.6 else "track=bad" if track_wins <= 0.4 else "track=mid")
+    return f
+
+
+def features_europe(*, role_class: str, value: float, delay: int | None, cluster: int,
+                    track_wins: float | None) -> list[str]:
+    f = [f"role={role_class}",
+         "value=" + backtest._bucket(value, [(50_000, "<50K"), (250_000, "50-250K"), (1_000_000, "250K-1M")], ">=1M")]
+    if delay is not None:
+        f.append("delay=" + ("<=2" if delay <= 2 else "3-5" if delay <= 5 else ">5"))
+    if cluster >= 3:
+        f.append("cluster=3+")
+    elif cluster == 2:
+        f.append("cluster=2")
+    if track_wins is not None:
+        f.append("track=good" if track_wins >= 0.6 else "track=bad" if track_wins <= 0.4 else "track=mid")
+    return f
+
+
 def fit(rows: list[dict]) -> dict | None:
     """rows : résultats d'OUTCOMES_SQL annotés (annotate_track). Renvoie modèle + métriques, ou None."""
     data = []
@@ -133,8 +170,14 @@ def fit(rows: list[dict]) -> dict | None:
         if ex is None:
             continue
         data.append((r["filed_date"], row_features(r), 1 if ex > 0 else 0, ex))
-    if len(data) < 500:
-        return None
+    return fit_samples(data)
+
+
+def fit_samples(data: list[tuple], min_samples: int = 500) -> dict | None:
+    """data : [(date, variables, gagnant 0/1, écart de performance)], quelle que soit la source."""
+    if len(data) < min_samples:
+        return {"model": None, "metrics": {"samples": len(data), "validated": False,
+                                           "reason": f"pas assez d'historique ({len(data)} / {min_samples})"}}
     data.sort(key=lambda d: d[0])
     cut = int(len(data) * 0.7)
     train_set, test_set = data[:cut], data[cut:]
@@ -160,7 +203,8 @@ def fit(rows: list[dict]) -> dict | None:
         "test_period": [test_set[0][0].isoformat(), test_set[-1][0].isoformat()],
         "auc": round(test_auc, 3) if test_auc is not None else None,
         "test_all": stats(test_set), "test_top20": stats(top), "test_bottom20": stats(bottom),
-        "validated": bool(test_auc and test_auc >= MIN_AUC
+        # au moins MIN_TEST signaux de test : en dessous, l'écart du meilleur quintile peut être du bruit
+        "validated": bool(test_auc and test_auc >= MIN_AUC and len(test_set) >= MIN_TEST
                           and stats(top)["win"] > stats(test_set)["win"]),
     }
     final["quantiles"] = quantiles
@@ -186,7 +230,8 @@ def explain(model: dict, fs: list[str], p: float, limit: int = 5) -> list[str]:
 
 def describe_feature(f: str) -> str:
     k, _, v = f.partition("=")
-    return {"value": f"Montant {v.replace('<', '< ').replace('>=', '≥ ')} $", "delay": f"Délai de déclaration {v} j",
+    return {"value": f"Montant {v.replace('<', '< ').replace('>=', '≥ ')}", "delay": f"Délai de déclaration {v} j",
+            "amount": f"Montant minimum {v.replace('<', '< ').replace('>=', '≥ ')} $",
             "pos": "Première ligne dans la société" if v == "first" else f"Ligne augmentée de {v} %",
             "cap": f"Capitalisation {v}", "role": v, "track": "Track record neutre"}.get(k, f)
 

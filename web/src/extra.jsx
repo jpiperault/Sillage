@@ -3,6 +3,7 @@ import { api } from './api.js'
 import { Notice, Score, Seg, SignalTable, useApi } from './components.jsx'
 import Ticket from './Ticket.jsx'
 import { date, datetime, int, money, pct, tone, usd } from './format.js'
+import { PriceAlerts } from './v21.jsx'
 
 /* ------------------------------------------------------------ Backtest du score */
 
@@ -285,6 +286,7 @@ export function StockPage({ ticker }) {
           </div>
           <Notice msg={msg} />
         </section>
+        <PriceAlerts ticker={data.ticker} />
         <section className="panel" aria-label="Signaux sur ce titre">
           <h2>Signaux <span className="muted small">12 derniers mois</span></h2>
           <SignalTable items={data.signals} selected={selected} onSelect={setSelected} />

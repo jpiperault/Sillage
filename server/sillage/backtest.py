@@ -467,7 +467,7 @@ async def compute(conn) -> dict:
             " VALUES ('insider',%s,%s,%s,%s,%s,%s,%s)", tracks)
     await conn.commit()
     fitted = await asyncio.to_thread(score_model.fit, rows)
-    if fitted:
+    if fitted and fitted.get("model"):
         await conn.execute("UPDATE score_models SET active=false WHERE side='P'")
         await conn.execute(
             "INSERT INTO score_models (side, model, metrics, active) VALUES ('P', %s::jsonb, %s::jsonb, %s)",
@@ -475,7 +475,19 @@ async def compute(conn) -> dict:
         await conn.execute("DELETE FROM score_models WHERE id NOT IN (SELECT id FROM score_models ORDER BY id DESC LIMIT 10)")
         await conn.commit()
     congress = await congress_tracks(conn)
-    return {"signals": report["signals"], "groups": len(report["groups"]), "insider_tracks": len(tracks),
+    extra = {}
+    for side, loader in (("congress", congress_samples), ("europe", europe_samples)):
+        samples = await loader(conn)
+        fitted_side = await asyncio.to_thread(score_model.fit_samples, samples, 300)
+        if fitted_side and fitted_side.get("model"):
+            await conn.execute("UPDATE score_models SET active=false WHERE side=%s", (side,))
+            await conn.execute(
+                "INSERT INTO score_models (side, model, metrics, active) VALUES (%s, %s::jsonb, %s::jsonb, %s)",
+                (side, json_dumps(fitted_side["model"]), json_dumps(fitted_side["metrics"]),
+                 fitted_side["metrics"]["validated"]))
+            await conn.commit()
+        extra[side] = (fitted_side or {}).get("metrics", {}).get("auc") or (fitted_side or {}).get("metrics", {}).get("reason")
+    return {**extra, "signals": report["signals"], "groups": len(report["groups"]), "insider_tracks": len(tracks),
             "congress_tracks": congress,
             "model": (fitted or {}).get("metrics", {}).get("auc"), "validated": (fitted or {}).get("metrics", {}).get("validated")}
 
@@ -541,3 +553,89 @@ async def congress_tracks(conn) -> int:
 def json_dumps(obj) -> str:
     import json
     return json.dumps(obj, default=str, ensure_ascii=False)
+
+
+EU_BENCHMARK = "FR0007052782"  # ETF CAC 40 (Euronext Paris) : référence des actions françaises
+
+
+def _chrono_track(samples: list[dict], key: str) -> None:
+    """Track record de la personne AVANT chaque signal (rendement à 3 mois connu ~95 jours après)."""
+    hist: dict[str, list[tuple]] = {}
+    for s in sorted(samples, key=lambda s: s["d"]):
+        past = [x for (known, x) in hist.get(s[key], []) if known <= s["d"]]
+        s["track_wins"] = (sum(1 for x in past if x > 0) / len(past)) if len(past) >= TRACK_MIN else None
+        hist.setdefault(s[key], []).append((s["d"] + timedelta(days=95), s["ex"]))
+
+
+async def congress_samples(conn) -> list[tuple]:
+    from . import model as score_model
+    cur = await conn.execute(
+        """SELECT c.politician, c.chamber, c.amount_min, c.trade_date, c.report_date, e.close AS entry, x.close AS c63,
+                  se.close AS b0, sx.close AS b63,
+                  (SELECT count(DISTINCT c2.politician) FROM congress_trades c2 WHERE c2.side='buy'
+                    AND c2.ticker=c.ticker AND c2.report_date BETWEEN c.report_date - 30 AND c.report_date) AS cluster
+           FROM congress_trades c
+           JOIN LATERAL (SELECT idx, close, day FROM price_history p WHERE p.ticker=c.ticker AND p.day > c.report_date
+                         ORDER BY p.day LIMIT 1) e ON true
+           JOIN LATERAL (SELECT idx, close FROM price_history p WHERE p.ticker=%(b)s AND p.day >= e.day
+                         ORDER BY p.day LIMIT 1) se ON true
+           JOIN price_history x ON x.ticker=c.ticker AND x.idx=e.idx+63
+           JOIN price_history sx ON sx.ticker=%(b)s AND sx.idx=se.idx+63
+           WHERE c.side='buy' AND c.ticker IS NOT NULL AND c.report_date IS NOT NULL""", {"b": BENCHMARK})
+    rows = await cur.fetchall()
+    await conn.commit()
+    samples = [{"d": r["report_date"], "who": r["politician"], "r": r,
+                "ex": (float(r["c63"]) / float(r["entry"]) - 1) - (float(r["b63"]) / float(r["b0"]) - 1)} for r in rows]
+    _chrono_track(samples, "who")
+    out = []
+    for s in samples:
+        r = s["r"]
+        delay = (r["report_date"] - r["trade_date"]).days if r["trade_date"] else None
+        fs = score_model.features_congress(amount_min=float(r["amount_min"] or 0), delay=delay,
+                                           cluster=int(r["cluster"] or 0), chamber=r["chamber"],
+                                           track_wins=s["track_wins"])
+        out.append((s["d"], fs, 1 if s["ex"] > 0 else 0, s["ex"]))
+    return sorted(out, key=lambda x: x[0])
+
+
+def europe_role_class(source: str, role: str | None) -> str:
+    from . import scoring
+    low = (role or "").lower()
+    if source == "bafin":
+        return {"vorstand": "top", "aufsichtsrat": "other", "sonstige führungsperson": "other"}.get(low, "close")
+    if "étroitement liée" in low or not role:
+        return "close"
+    return "top" if scoring._TOP_TITLE.search(role) else "other"
+
+
+async def europe_samples(conn) -> list[tuple]:
+    from . import model as score_model
+    cur = await conn.execute(
+        """SELECT t.src, t.person, t.role, t.value, t.trade_date, t.published, e.close AS entry, x.close AS c63,
+                  se.close AS b0, sx.close AS b63,
+                  (SELECT count(DISTINCT a.person) FROM amf_trades a WHERE a.side='buy' AND a.isin=t.isin
+                    AND a.published BETWEEN t.published - 30 AND t.published) AS cluster
+           FROM (SELECT 'amf' AS src, person, role, value, trade_date, published, isin FROM amf_trades WHERE side='buy'
+                 UNION ALL SELECT 'bafin', person, role, value, trade_date, published, isin FROM bafin_trades
+                 WHERE side='buy') t
+           JOIN LATERAL (SELECT idx, close, day FROM price_history p WHERE p.ticker=t.isin AND p.day > t.published
+                         ORDER BY p.day LIMIT 1) e ON true
+           JOIN LATERAL (SELECT idx, close FROM price_history p WHERE p.ticker=%(b)s AND p.day >= e.day
+                         ORDER BY p.day LIMIT 1) se ON true
+           JOIN price_history x ON x.ticker=t.isin AND x.idx=e.idx+63
+           JOIN price_history sx ON sx.ticker=%(b)s AND sx.idx=se.idx+63
+           WHERE t.published IS NOT NULL""", {"b": EU_BENCHMARK})
+    rows = await cur.fetchall()
+    await conn.commit()
+    samples = [{"d": r["published"], "who": r["person"], "r": r,
+                "ex": (float(r["c63"]) / float(r["entry"]) - 1) - (float(r["b63"]) / float(r["b0"]) - 1)} for r in rows]
+    _chrono_track(samples, "who")
+    out = []
+    for s in samples:
+        r = s["r"]
+        delay = (r["published"] - r["trade_date"]).days if r["trade_date"] else None
+        fs = score_model.features_europe(role_class=europe_role_class(r["src"], r["role"]),
+                                         value=float(r["value"] or 0), delay=delay, cluster=int(r["cluster"] or 0),
+                                         track_wins=s["track_wins"])
+        out.append((s["d"], fs, 1 if s["ex"] > 0 else 0, s["ex"]))
+    return sorted(out, key=lambda x: x[0])

@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { api } from './api.js'
 import { Notice, Score, Seg, SignalTable, useApi } from './components.jsx'
 import Ticket from './Ticket.jsx'
 import { date, datetime, int, money, pct, signed, tone, usd } from './format.js'
+import { PositionEditor, RuleSimulator } from './v21.jsx'
 
 export function ExportLink({ href, label = 'Exporter en CSV' }) {
   return <a className="btn" href={'/api/v1' + href} download>{label}</a>
@@ -54,6 +55,10 @@ export function Summary() {
                 <li key={e.ticker + e.day}><a href={`#action/${e.ticker}`}><b>{e.ticker}</b></a> le {date(e.day)}{e.timing ? ` (${e.timing})` : ''}</li>
               ))}</ul>
             )}
+            {data.price_alerts?.length > 0 && (<>
+              <h3>Alertes de cours déclenchées</h3>
+              <ul className="reasons">{data.price_alerts.map((a) => <li key={a.id}><a href={`#action/${a.ticker}`}><b>{a.ticker}</b></a> {a.direction === 'above' ? 'au-dessus de' : 'en dessous de'} {Number(a.price)} (à {Number(a.triggered_price)}, {datetime(a.triggered_at)})</li>)}</ul>
+            </>)}
             {data.new_13f.length > 0 && (<>
               <h3>Nouveaux 13F (7 jours)</h3>
               <ul className="reasons">{data.new_13f.map((f) => <li key={f.fund_name + f.period}>{f.fund_name} — trimestre au {date(f.period)}</li>)}</ul>
@@ -96,6 +101,7 @@ export function TrainingV2() {
   const [book, setBook] = useState('manual')
   const { data: p, error, reload } = useApi(`/paper?book=${book}`)
   const [msg, setMsg] = useState(null)
+  const [editing, setEditing] = useState(null)
 
   async function sell(ticker) {
     try {
@@ -113,7 +119,7 @@ export function TrainingV2() {
       <div className="filters">
         <Seg label="Portefeuille" value={book} onChange={(b) => { setBook(b); setMsg(null) }} options={BOOKS} />
       </div>
-      {book === 'rule' && <RuleForm onSaved={reload} />}
+      {book === 'rule' && <><RuleSimulator /><RuleForm onSaved={reload} /></>}
       {error && !p && <Notice msg={{ type: 'error', text: error }} />}
       {p && (<>
         <div className="stats num">
@@ -135,16 +141,21 @@ export function TrainingV2() {
             <div className="table-wrap"><table>
               <thead><tr><th>Ticker</th><th className="r">Quantité</th><th className="r">Prix moyen</th><th className="r">Cours</th>
                 <th className="r">Valeur</th><th className="r">P&amp;L</th><th className="r">Stop</th><th>Ouverte</th><th></th></tr></thead>
-              <tbody>{p.positions.map((x) => (
-                <tr key={x.ticker}>
+              <tbody>{p.positions.map((x) => (<Fragment key={x.ticker}>
+                <tr>
                   <td className="ticker"><a href={`#action/${x.ticker}`}>{x.ticker}</a>{x.currency === 'EUR' && <span className="muted small"> €→$</span>}</td>
                   <td className="r num">{int(x.quantity)}</td><td className="r num">{usd(x.avg_price)}</td>
                   <td className="r num">{usd(x.last_price)}</td><td className="r num">{usd(x.value)}</td>
                   <td className={`r num ${tone(x.pnl)}`}>{signed(x.pnl)} ({pct(x.pnl_pct)})</td>
-                  <td className="r num down">{usd(x.stop_price)}</td><td className="num">{date(x.opened_at)}</td>
-                  <td><button type="button" className="btn danger" onClick={() => sell(x.ticker)}>Vendre</button></td>
+                  <td className="r num down">{usd(x.stop_price)}{x.trailing_pct != null && <div className="muted small">suiveur {x.trailing_pct} %</div>}{x.target_price != null && <div className="up small">objectif {usd(x.target_price)}</div>}</td>
+                  <td className="num">{date(x.opened_at)}{x.note && <div className="muted small wrap" style={{ maxWidth: 200 }}>{x.note}</div>}</td>
+                  <td><div className="btn-row">
+                    <button type="button" className="btn" aria-expanded={editing === x.ticker} onClick={() => setEditing(editing === x.ticker ? null : x.ticker)}>Gérer</button>
+                    <button type="button" className="btn danger" onClick={() => sell(x.ticker)}>Tout vendre</button>
+                  </div></td>
                 </tr>
-              ))}</tbody>
+                {editing === x.ticker && <tr><td colSpan={9}><PositionEditor pos={x} book={book} onDone={(t) => { setEditing(null); setMsg({ type: 'ok', text: t }); reload() }} /></td></tr>}
+              </Fragment>))}</tbody>
             </table></div>
           )}
         </section>
@@ -215,12 +226,14 @@ function RuleForm({ onSaved }) {
 /* ------------------------------------------------------------ Score v2 */
 
 export function ModelPanel() {
-  const { data } = useApi('/model')
+  const [side, setSide] = useState('P')
+  const { data } = useApi(`/model?side=${side}`)
   const m = data?.model
   return (
     <section className="panel" aria-label="Score v2">
       <h2>Score v2 <span className="muted small">calibré sur le backtest</span></h2>
-      {!m ? <p className="muted">Pas encore de modèle : il est entraîné avec le premier rapport de backtest complet.</p> : (
+      <div className="filters"><Seg label="Source" value={side} onChange={setSide} options={[['P', 'Initiés US'], ['congress', 'Élus'], ['europe', 'Europe']]} /></div>
+      {!m ? <p className="muted">{side === 'P' ? 'Pas encore de modèle : il est entraîné avec le premier rapport de backtest complet.' : "Pas encore de modèle : il faut au moins 300 achats dont la performance à 3 mois est connue. L'historique se construit au fil de la collecte."}</p> : (
         <>
           <p>
             {data.in_use ? <span className="badge buy">utilisé</span> : <span className="badge option">non utilisé</span>}{' '}
@@ -243,7 +256,7 @@ export function ModelPanel() {
               ))}</tbody>
             </table></div>
           </details>
-          <p className="muted small">Le score v2 = rang centile de la probabilité estimée de battre la référence de marché à 3 mois (S&amp;P 500 au-dessus de 2 Md$ de capitalisation, Russell 2000 en dessous). Achats d'initiés américains uniquement ; les autres sources gardent le score v1.</p>
+          <p className="muted small">Le score v2 = rang centile de la probabilité estimée de battre la référence de marché à 3 mois ({side === 'P' ? 'S&P 500 au-dessus de 2 Md$ de capitalisation, Russell 2000 en dessous' : side === 'congress' ? 'S&P 500' : 'ETF CAC 40'}). Une source sans modèle validé garde le score v1.</p>
         </>
       )}
     </section>

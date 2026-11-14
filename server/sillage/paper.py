@@ -71,15 +71,25 @@ async def buy(conn, user_id: int, ticker: str, quantity: float, price: float, st
 
 
 async def sell_all(conn, user_id: int, ticker: str, price: float, reason: str = "manual", book: str = "manual",
-                   note: str | None = None) -> dict:
+                   note: str | None = None, quantity: float | None = None) -> dict:
+    """Vente de toute la ligne, ou d'une partie si `quantity` est plus petite que la position."""
     px = _d(price)
     cur = await conn.execute(
-        "DELETE FROM paper_positions WHERE user_id=%s AND book=%s AND ticker=%s"
-        " RETURNING quantity, avg_price, signal_ref", (user_id, book, ticker))
+        "SELECT quantity, avg_price, signal_ref FROM paper_positions WHERE user_id=%s AND book=%s AND ticker=%s"
+        " FOR UPDATE", (user_id, book, ticker))
     pos = await cur.fetchone()
     if not pos:
         raise PaperError(f"Aucune position fictive sur {ticker}.")
-    qty = _d(pos["quantity"])
+    held = _d(pos["quantity"])
+    qty = held if quantity is None else _d(quantity)
+    if qty <= 0 or qty > held:
+        raise PaperError(f"Quantité invalide : vous détenez {float(held):g} {ticker}.")
+    if qty == held:
+        await conn.execute("DELETE FROM paper_positions WHERE user_id=%s AND book=%s AND ticker=%s",
+                           (user_id, book, ticker))
+    else:
+        await conn.execute("UPDATE paper_positions SET quantity = quantity - %s WHERE user_id=%s AND book=%s"
+                           " AND ticker=%s", (qty, user_id, book, ticker))
     pnl = (px - _d(pos["avg_price"])) * qty
     await conn.execute("UPDATE paper_accounts SET cash = cash + %s WHERE user_id=%s AND book=%s",
                        (qty * px, user_id, book))
@@ -88,7 +98,37 @@ async def sell_all(conn, user_id: int, ticker: str, price: float, reason: str = 
         " VALUES (%s,%s,%s,'sell',%s,%s,%s,%s,%s,%s)",
         (user_id, book, ticker, qty, px, pnl, reason, pos["signal_ref"], note))
     return {"ticker": ticker, "side": "sell", "quantity": float(qty), "price": float(px), "pnl": float(pnl),
-            "book": book}
+            "book": book, "remaining": float(held - qty)}
+
+
+async def update_position(conn, user_id: int, book: str, ticker: str, *, stop_pct: float | None,
+                          trailing_pct: float | None, target_price: float | None, note: str | None) -> dict:
+    """Règles de sortie d'une ligne : stop fixe (% sous le prix moyen), stop suiveur (% sous le plus haut atteint),
+    objectif de gain (cours cible), note libre."""
+    cur = await conn.execute(
+        f"""SELECT p.avg_price, p.high_price, {PRICE_USD_SQL} AS last FROM paper_positions p
+            LEFT JOIN prices pr ON pr.ticker = p.ticker
+            WHERE p.user_id=%s AND p.book=%s AND p.ticker=%s FOR UPDATE OF p""", (user_id, book, ticker))
+    pos = await cur.fetchone()
+    if not pos:
+        raise PaperError(f"Aucune position fictive sur {ticker}.")
+    avg = _d(pos["avg_price"])
+    high = max(x for x in (_d(pos["high_price"] or 0), _d(pos["last"] or 0), avg))
+    stop = None
+    if stop_pct is not None:
+        stop = avg * (1 - _d(stop_pct) / 100)
+    if trailing_pct is not None:
+        trail = high * (1 - _d(trailing_pct) / 100)
+        stop = max(stop or Decimal(0), trail)
+    if target_price is not None and _d(target_price) <= avg:
+        raise PaperError("L'objectif doit être au-dessus du prix moyen.")
+    await conn.execute(
+        """UPDATE paper_positions SET stop_price=%s, trailing_pct=%s, high_price=%s, target_price=%s, note=%s
+           WHERE user_id=%s AND book=%s AND ticker=%s""",
+        (stop, trailing_pct, high if trailing_pct is not None else None, target_price, (note or "").strip() or None,
+         user_id, book, ticker))
+    return {"ticker": ticker, "stop_price": float(stop) if stop is not None else None,
+            "trailing_pct": trailing_pct, "target_price": target_price}
 
 
 async def reset(conn, user_id: int, start_cash: float, book: str = "manual") -> None:
@@ -110,6 +150,7 @@ async def summary(conn, user_id: int, start_cash: float, book: str = "manual") -
     acct = await ensure_account(conn, user_id, start_cash, book)
     cur = await conn.execute(
         f"""SELECT p.ticker, p.quantity, p.avg_price, p.stop_price, p.signal_ref, p.opened_at, p.currency,
+                  p.trailing_pct, p.target_price, p.high_price, p.note,
                   {PRICE_USD_SQL} AS last_price, pr.price AS local_price, pr.fetched_at AS price_at
            FROM paper_positions p LEFT JOIN prices pr ON pr.ticker = p.ticker
            WHERE p.user_id=%s AND p.book=%s ORDER BY p.opened_at""",
@@ -128,6 +169,9 @@ async def summary(conn, user_id: int, start_cash: float, book: str = "manual") -
             "last_price": float(last), "price_at": r["price_at"], "value": float(value),
             "pnl": float(value - qty * avg), "pnl_pct": float((last / avg - 1) * 100) if avg else 0.0,
             "signal_ref": r["signal_ref"], "opened_at": r["opened_at"],
+            "trailing_pct": float(r["trailing_pct"]) if r["trailing_pct"] is not None else None,
+            "target_price": float(r["target_price"]) if r["target_price"] is not None else None,
+            "note": r["note"],
         })
     cur = await conn.execute(
         "SELECT id, ticker, side, quantity, price, pnl, reason, signal_ref, note, created_at FROM paper_orders"
@@ -156,20 +200,34 @@ async def summary(conn, user_id: int, start_cash: float, book: str = "manual") -
 
 
 async def apply_stops(conn) -> int:
-    """Vend les positions dont le dernier cours connu (en dollars) est passé sous le stop (−8 %)."""
+    """À chaque cycle : remonte les stops suiveurs, puis vend au stop ou à l'objectif (cours en dollars)."""
+    await conn.execute(
+        f"""UPDATE paper_positions p SET high_price = greatest(coalesce(p.high_price, 0), {PRICE_USD_SQL}),
+                stop_price = greatest(coalesce(p.stop_price, 0),
+                                      greatest(coalesce(p.high_price, 0), {PRICE_USD_SQL}) * (1 - p.trailing_pct / 100))
+            FROM prices pr WHERE pr.ticker = p.ticker AND p.trailing_pct IS NOT NULL""")
     cur = await conn.execute(
-        f"""SELECT p.user_id, p.book, p.ticker, {PRICE_USD_SQL} AS price
+        f"""SELECT p.user_id, p.book, p.ticker, p.trailing_pct, p.stop_price, p.target_price, p.avg_price,
+                   {PRICE_USD_SQL} AS price
            FROM paper_positions p JOIN prices pr ON pr.ticker = p.ticker
-           WHERE p.stop_price IS NOT NULL AND {PRICE_USD_SQL} <= p.stop_price""")
+           WHERE (p.stop_price IS NOT NULL AND {PRICE_USD_SQL} <= p.stop_price)
+              OR (p.target_price IS NOT NULL AND {PRICE_USD_SQL} >= p.target_price)""")
     rows = await cur.fetchall()
     n = 0
     for r in rows:
         if r["price"] is None:
             continue
+        price = _d(r["price"])
+        if r["target_price"] is not None and price >= _d(r["target_price"]):
+            reason = "target"
+        elif r["trailing_pct"] is not None and _d(r["stop_price"]) > _d(r["avg_price"]) * (1 - STOP_PCT):
+            reason = "trailing"
+        else:
+            reason = "stop"
         try:
-            await sell_all(conn, r["user_id"], r["ticker"], r["price"], reason="stop", book=r["book"])
+            await sell_all(conn, r["user_id"], r["ticker"], r["price"], reason=reason, book=r["book"])
             n += 1
-            _log.info("stop déclenché : %s à %s", r["ticker"], r["price"])
+            _log.info("%s déclenché : %s à %s", reason, r["ticker"], r["price"])
         except PaperError:
             pass
     await conn.commit()
